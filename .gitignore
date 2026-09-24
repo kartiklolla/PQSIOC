@@ -2,4 +2,6 @@
 pqiot-server
 pqiot-client
 pqiot-selftest
+*.rv64
 *.pcap
+build/
