@@ -11,14 +11,21 @@
  * Handshake:
  *   server -> device  PUBKEY  ML-KEM-768 public key            (1184 B)
  *   device -> server  KEMCT   ML-KEM-768 cipher text           (1088 B)
- *   server -> device  CERT    server's ML-DSA-65 certificate   (DER)
- *   server -> device  VERIFY  ML-DSA-65 signature over the transcript
- *   device -> server  CERT    device's ML-DSA-65 certificate   (DER)
- *   device -> server  VERIFY  ML-DSA-65 signature over the transcript
+ *   server -> device  CERT    server's ML-DSA-65 certificate   (DER)  *
+ *   server -> device  VERIFY  ML-DSA-65 signature over the transcript *
+ *   device -> server  CERT    device's ML-DSA-65 certificate   (DER)  *
+ *   device -> server  VERIFY  ML-DSA-65 signature over the transcript *
  *   either direction  DATA    [12B IV][16B tag][ct]
  *
- * The transcript is SHA-256 over every handshake message (header and body)
- * sent or received so far, so each signature covers the ML-KEM public key,
+ *   * sealed like DATA, under the handshake keys: [12B IV][16B tag][ct]
+ *
+ * CERT and VERIFY are encrypted so an observer can't tell which device is
+ * talking, or to whom. The device only sends its CERT once the server has
+ * proven itself, so even an active attacker never sees the device's
+ * identity (the server's goes to whoever ran the KEM, as in TLS 1.3).
+ *
+ * The transcript is SHA-256 over every handshake message (header and
+ * plaintext body) sent or received so far, so each signature covers the ML-KEM public key,
  * the cipher text, and everything the peer has said. Swapping any of them --
  * a man in the middle substituting his own KEM key, say -- breaks the
  * signature. Signatures carry a per-role ML-DSA context string, so a
@@ -26,7 +33,8 @@
  *
  * The KEM shared secret is never used as an AES key directly; it is expanded
  * by HKDF-SHA256 into one key per direction so the two sides can never reuse
- * an (key, IV) pair against each other.
+ * an (key, IV) pair against each other -- and separately for the handshake
+ * and for DATA, so a sealed CERT or VERIFY can never pass as DATA.
  */
 #ifndef PQIOT_H
 #define PQIOT_H
@@ -82,10 +90,12 @@
 
 #define PQIOT_DEFAULT_PORT 4433
 
-/* Directional key pair derived from one KEM shared secret. */
+/* Keys derived from one KEM shared secret: per direction, and per phase. */
 typedef struct {
-    uint8_t c2s[PQIOT_KEY_SZ]; /* client -> server */
-    uint8_t s2c[PQIOT_KEY_SZ]; /* server -> client */
+    uint8_t hs_c2s[PQIOT_KEY_SZ]; /* CERT/VERIFY, client -> server */
+    uint8_t hs_s2c[PQIOT_KEY_SZ]; /* CERT/VERIFY, server -> client */
+    uint8_t c2s[PQIOT_KEY_SZ];    /* DATA, client -> server */
+    uint8_t s2c[PQIOT_KEY_SZ];    /* DATA, server -> client */
 } pqiot_keys;
 
 /* All functions return 0 on success and a negative value on failure. */
@@ -93,7 +103,7 @@ typedef struct {
 /* Process-wide CSPRNG, seeded on first use. NULL if seeding failed. */
 WC_RNG *pqiot_rng(void);
 
-/* Expand the 32-byte KEM shared secret into the two directional keys. */
+/* Expand the 32-byte KEM shared secret into the four keys above. */
 int pqiot_derive_keys(const uint8_t *ss, size_t ss_len, pqiot_keys *out);
 
 /* AES-256-GCM. `out` needs ptlen + PQIOT_AEAD_OVERHEAD bytes; the IV is
@@ -108,6 +118,13 @@ int pqiot_open(const uint8_t key[PQIOT_KEY_SZ], const uint8_t *in, size_t inlen,
 /* Framed socket I/O. Both handle short reads/writes. */
 int pqiot_send(int fd, uint8_t type, const uint8_t *body, size_t len);
 int pqiot_recv(int fd, uint8_t *type, uint8_t *body, size_t cap, size_t *len);
+
+/* Framed I/O with the body sealed/opened under `key` (pqiot_seal/open).
+ * recv fails unless the frame is of type `want` and authenticates. */
+int pqiot_send_sealed(int fd, const uint8_t key[PQIOT_KEY_SZ], uint8_t type,
+                      const uint8_t *pt, size_t ptlen);
+int pqiot_recv_sealed(int fd, const uint8_t key[PQIOT_KEY_SZ], uint8_t want,
+                      uint8_t *pt, size_t ptcap, size_t *ptlen);
 
 /* Our side of the authentication: a certificate from the demo CA and its
  * ML-DSA-65 signing key. */

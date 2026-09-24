@@ -73,7 +73,7 @@ tshark -r "$OUT" -Y 'tcp.payload contains 50:51:49:4f' \
 
 echo
 echo "== handshake bodies: ML-KEM-768 public key (1184) and cipher text (1088),"
-echo "   then each side's ML-DSA-65 CERT + VERIFY (~5.5 KB + 3309, one segment)"
+echo "   then each side's sealed ML-DSA-65 CERT + VERIFY (~5.5 KB + 3309, one segment)"
 tshark -r "$OUT" -Y 'tcp.len > 900' \
        -T fields -e frame.number -e tcp.srcport -e tcp.len \
        -E header=y -E separator=' '
@@ -86,6 +86,19 @@ if tshark -r "$OUT" -Y "tcp.payload contains \"$MSG\"" -T fields -e frame.number
     exit 1
 fi
 echo "ok: \"$MSG\" does not appear in $OUT"
+
+# CERT and VERIFY are sealed, so neither side's identity is readable either.
+# (Against a PQIOT/2 build that sent them in clear, this check fails.)
+echo
+echo "== neither certificate's name appears in any captured packet"
+for name in server.pqiot.test device-0001.pqiot.test; do
+    if tshark -r "$OUT" -Y "tcp.payload contains \"$name\"" -T fields \
+            -e frame.number | grep -q .; then
+        echo "FAIL: certificate name \"$name\" found in the capture" >&2
+        exit 1
+    fi
+    echo "ok: \"$name\" does not appear in $OUT"
+done
 
 echo
 echo "wrote $OUT  --  open with:  wireshark $OUT"

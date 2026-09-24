@@ -38,23 +38,26 @@ static int connect_to(const char *host, uint16_t port)
 }
 
 /* Steps 3-4: the server proves it is PKI_SERVER_NAME. Then 5-6: we prove
- * who we are, over the same transcript. 0 on success. */
-static int authenticate(int fd, pqiot_identity *id, wc_Sha256 *th)
+ * who we are, over the same transcript. All four travel sealed under the
+ * handshake keys; the transcript hashes their plaintext. Our CERT goes out
+ * only after the server checks out, so our identity never reaches anyone
+ * else. 0 on success. */
+static int authenticate(int fd, pqiot_identity *id, wc_Sha256 *th,
+                        const pqiot_keys *keys)
 {
     uint8_t cert[PQIOT_MAX_BODY], sig[PQIOT_SIG_SZ];
     size_t cert_len, siglen;
     char cn[256];
-    uint8_t type;
 
-    if (pqiot_recv(fd, &type, cert, sizeof(cert), &cert_len) != 0 ||
-        type != PQIOT_MSG_CERT ||
-        pqiot_transcript_add(th, type, cert, cert_len) != 0) {
-        fprintf(stderr, "client: expected server CERT\n");
+    if (pqiot_recv_sealed(fd, keys->hs_s2c, PQIOT_MSG_CERT,
+                          cert, sizeof(cert), &cert_len) != 0 ||
+        pqiot_transcript_add(th, PQIOT_MSG_CERT, cert, cert_len) != 0) {
+        fprintf(stderr, "client: expected sealed server CERT\n");
         return -1;
     }
-    if (pqiot_recv(fd, &type, sig, sizeof(sig), &siglen) != 0 ||
-        type != PQIOT_MSG_VERIFY) {
-        fprintf(stderr, "client: expected server VERIFY\n");
+    if (pqiot_recv_sealed(fd, keys->hs_s2c, PQIOT_MSG_VERIFY,
+                          sig, sizeof(sig), &siglen) != 0) {
+        fprintf(stderr, "client: expected sealed server VERIFY\n");
         return -1;
     }
     if (pqiot_auth_verify(PKI_CA_FILE, cert, cert_len, PKI_SERVER_NAME, th,
@@ -68,14 +71,15 @@ static int authenticate(int fd, pqiot_identity *id, wc_Sha256 *th)
            cn);
 
     if (pqiot_transcript_add(th, PQIOT_MSG_VERIFY, sig, siglen) != 0 ||
-        pqiot_send(fd, PQIOT_MSG_CERT, id->cert, id->cert_len) != 0 ||
+        pqiot_send_sealed(fd, keys->hs_c2s, PQIOT_MSG_CERT,
+                          id->cert, id->cert_len) != 0 ||
         pqiot_transcript_add(th, PQIOT_MSG_CERT, id->cert, id->cert_len) != 0 ||
         pqiot_auth_sign(id, th, PQIOT_ROLE_DEVICE, sig, &siglen) != 0 ||
-        pqiot_send(fd, PQIOT_MSG_VERIFY, sig, siglen) != 0) {
+        pqiot_send_sealed(fd, keys->hs_c2s, PQIOT_MSG_VERIFY, sig, siglen) != 0) {
         fprintf(stderr, "client: sending our CERT/VERIFY failed\n");
         return -1;
     }
-    printf("[device] -> CERT     %zu bytes, VERIFY %zu bytes (ML-DSA-65)\n",
+    printf("[device] -> CERT     %zu bytes, VERIFY %zu bytes (ML-DSA-65, sealed)\n",
            id->cert_len, siglen);
     return 0;
 }
@@ -137,7 +141,7 @@ static int run(int fd, const char *msg, pqiot_identity *id)
     printf("[device] shared secret established, AES-256 keys derived\n");
 
     /* No telemetry leaves before the server has proven who it is. */
-    if (authenticate(fd, id, &th) != 0)
+    if (authenticate(fd, id, &th, &keys) != 0)
         goto out;
 
     /* 7. Encrypt the payload under the KEM-derived key and ship it. */

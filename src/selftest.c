@@ -37,24 +37,28 @@ static void test_kem_agreement(void)
            sizeof(pub), sizeof(ct));
 }
 
-/* Same secret in => same keys out, and the two directions must differ. */
+/* Same secret in => same keys out, and all four keys must differ. */
 static void test_key_derivation(void)
 {
     uint8_t ss[PQIOT_SS_SZ];
     pqiot_keys a, b;
+    const uint8_t *k[4];
+    int i, j;
 
     memset(ss, 0xA5, sizeof(ss));
     assert(pqiot_derive_keys(ss, sizeof(ss), &a) == 0);
     assert(pqiot_derive_keys(ss, sizeof(ss), &b) == 0);
 
-    assert(memcmp(a.c2s, b.c2s, PQIOT_KEY_SZ) == 0); /* deterministic */
-    assert(memcmp(a.s2c, b.s2c, PQIOT_KEY_SZ) == 0);
-    assert(memcmp(a.c2s, a.s2c, PQIOT_KEY_SZ) != 0); /* separated */
+    assert(memcmp(&a, &b, sizeof(a)) == 0); /* deterministic */
+    k[0] = a.hs_c2s; k[1] = a.hs_s2c; k[2] = a.c2s; k[3] = a.s2c;
+    for (i = 0; i < 4; i++)                  /* separated */
+        for (j = i + 1; j < 4; j++)
+            assert(memcmp(k[i], k[j], PQIOT_KEY_SZ) != 0);
 
     /* A wrong-sized secret must be refused, not silently padded. */
     assert(pqiot_derive_keys(ss, sizeof(ss) - 1, &a) != 0);
 
-    printf("ok  key derivation (HKDF-SHA256, directions separated)\n");
+    printf("ok  key derivation (HKDF-SHA256, directions and phases separated)\n");
 }
 
 static void test_aead_roundtrip(void)
@@ -140,9 +144,45 @@ static void test_framing(void)
     assert(write(sv[0], "XXXX\x03\x01\x00\x00", 8) == 8);
     assert(pqiot_recv(sv[1], &type, got, sizeof(got), &len) != 0);
 
+    /* Sealed frames: the body on the wire is not the plaintext, and it
+     * only opens under the right key and as the right type. Fresh pair:
+     * the rejections above deliberately left bytes unread in the old one. */
     close(sv[0]);
     close(sv[1]);
-    printf("ok  framing (roundtrip, bounds, bad magic rejected)\n");
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    {
+        static const char secret[] = "CN=device-0001.pqiot.test";
+        uint8_t key[PQIOT_KEY_SZ], wrong[PQIOT_KEY_SZ];
+
+        memset(key, 0x11, sizeof(key));
+        memset(wrong, 0x22, sizeof(wrong));
+
+        assert(pqiot_send_sealed(sv[0], key, PQIOT_MSG_CERT,
+                                 (const uint8_t *)secret, strlen(secret)) == 0);
+        assert(pqiot_recv(sv[1], &type, got, sizeof(got), &len) == 0);
+        assert(type == PQIOT_MSG_CERT && len == strlen(secret) + PQIOT_AEAD_OVERHEAD);
+        assert(memmem(got, len, secret, strlen(secret)) == NULL);
+
+        assert(pqiot_send_sealed(sv[0], key, PQIOT_MSG_CERT,
+                                 (const uint8_t *)secret, strlen(secret)) == 0);
+        assert(pqiot_recv_sealed(sv[1], key, PQIOT_MSG_CERT,
+                                 got, sizeof(got), &len) == 0);
+        assert(len == strlen(secret) && memcmp(got, secret, len) == 0);
+
+        assert(pqiot_send_sealed(sv[0], key, PQIOT_MSG_CERT,
+                                 (const uint8_t *)secret, strlen(secret)) == 0);
+        assert(pqiot_recv_sealed(sv[1], wrong, PQIOT_MSG_CERT,
+                                 got, sizeof(got), &len) != 0);
+
+        assert(pqiot_send_sealed(sv[0], key, PQIOT_MSG_CERT,
+                                 (const uint8_t *)secret, strlen(secret)) == 0);
+        assert(pqiot_recv_sealed(sv[1], key, PQIOT_MSG_VERIFY,
+                                 got, sizeof(got), &len) != 0);
+    }
+
+    close(sv[0]);
+    close(sv[1]);
+    printf("ok  framing (roundtrip, bounds, bad magic, sealed frames)\n");
 }
 
 /* A PEM certificate file as DER, as it would arrive in a CERT message. */

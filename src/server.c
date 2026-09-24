@@ -40,34 +40,36 @@ static int listen_on(uint16_t port)
 }
 
 /* Steps 3-4: prove we are the server. Then 5-6: make the device prove who
- * it is, over the same transcript. 0 on success. */
-static int authenticate(int fd, pqiot_identity *id, wc_Sha256 *th)
+ * it is, over the same transcript. All four travel sealed under the
+ * handshake keys; the transcript hashes their plaintext. 0 on success. */
+static int authenticate(int fd, pqiot_identity *id, wc_Sha256 *th,
+                        const pqiot_keys *keys)
 {
     uint8_t cert[PQIOT_MAX_BODY], sig[PQIOT_SIG_SZ];
     size_t cert_len, siglen;
     char cn[256];
-    uint8_t type;
 
-    if (pqiot_send(fd, PQIOT_MSG_CERT, id->cert, id->cert_len) != 0 ||
+    if (pqiot_send_sealed(fd, keys->hs_s2c, PQIOT_MSG_CERT,
+                          id->cert, id->cert_len) != 0 ||
         pqiot_transcript_add(th, PQIOT_MSG_CERT, id->cert, id->cert_len) != 0 ||
         pqiot_auth_sign(id, th, PQIOT_ROLE_SERVER, sig, &siglen) != 0 ||
-        pqiot_send(fd, PQIOT_MSG_VERIFY, sig, siglen) != 0 ||
+        pqiot_send_sealed(fd, keys->hs_s2c, PQIOT_MSG_VERIFY, sig, siglen) != 0 ||
         pqiot_transcript_add(th, PQIOT_MSG_VERIFY, sig, siglen) != 0) {
         fprintf(stderr, "server: sending our CERT/VERIFY failed\n");
         return -1;
     }
-    printf("[server] -> CERT     %zu bytes, VERIFY %zu bytes (ML-DSA-65)\n",
+    printf("[server] -> CERT     %zu bytes, VERIFY %zu bytes (ML-DSA-65, sealed)\n",
            id->cert_len, siglen);
 
-    if (pqiot_recv(fd, &type, cert, sizeof(cert), &cert_len) != 0 ||
-        type != PQIOT_MSG_CERT ||
-        pqiot_transcript_add(th, type, cert, cert_len) != 0) {
-        fprintf(stderr, "server: expected device CERT\n");
+    if (pqiot_recv_sealed(fd, keys->hs_c2s, PQIOT_MSG_CERT,
+                          cert, sizeof(cert), &cert_len) != 0 ||
+        pqiot_transcript_add(th, PQIOT_MSG_CERT, cert, cert_len) != 0) {
+        fprintf(stderr, "server: expected sealed device CERT\n");
         return -1;
     }
-    if (pqiot_recv(fd, &type, sig, sizeof(sig), &siglen) != 0 ||
-        type != PQIOT_MSG_VERIFY) {
-        fprintf(stderr, "server: expected device VERIFY\n");
+    if (pqiot_recv_sealed(fd, keys->hs_c2s, PQIOT_MSG_VERIFY,
+                          sig, sizeof(sig), &siglen) != 0) {
+        fprintf(stderr, "server: expected sealed device VERIFY\n");
         return -1;
     }
     if (pqiot_auth_verify(PKI_CA_FILE, cert, cert_len, NULL, th,
@@ -142,7 +144,7 @@ static int serve(int fd, pqiot_identity *id)
     printf("[server] shared secret established, AES-256 keys derived\n");
 
     /* No DATA is read before the device has proven who it is. */
-    if (authenticate(fd, id, &th) != 0)
+    if (authenticate(fd, id, &th, &keys) != 0)
         goto out;
 
     /* 7. Decrypt the device's payload under the KEM-derived key. */

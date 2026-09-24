@@ -40,21 +40,22 @@ int pqiot_derive_keys(const uint8_t *ss, size_t ss_len, pqiot_keys *out)
 {
     /* Distinct info strings => independent keys from one secret. No salt: the
      * KEM secret is already uniformly random, which is what a salt buys. */
-    static const char info_c2s[] = "PQIOT/2 c2s";
-    static const char info_s2c[] = "PQIOT/2 s2c";
+    const struct { const char *info; uint8_t *key; } k[] = {
+        { "PQIOT/2 hs c2s", out ? out->hs_c2s : NULL },
+        { "PQIOT/2 hs s2c", out ? out->hs_s2c : NULL },
+        { "PQIOT/2 c2s",    out ? out->c2s    : NULL },
+        { "PQIOT/2 s2c",    out ? out->s2c    : NULL },
+    };
+    size_t i;
 
     if (ss == NULL || out == NULL || ss_len != PQIOT_SS_SZ)
         return PQIOT_ERR;
 
-    if (wc_HKDF(WC_SHA256, ss, (word32)ss_len, NULL, 0,
-                (const byte *)info_c2s, (word32)(sizeof(info_c2s) - 1),
-                out->c2s, PQIOT_KEY_SZ) != 0)
-        return PQIOT_ERR;
-
-    if (wc_HKDF(WC_SHA256, ss, (word32)ss_len, NULL, 0,
-                (const byte *)info_s2c, (word32)(sizeof(info_s2c) - 1),
-                out->s2c, PQIOT_KEY_SZ) != 0)
-        return PQIOT_ERR;
+    for (i = 0; i < sizeof(k) / sizeof(k[0]); i++)
+        if (wc_HKDF(WC_SHA256, ss, (word32)ss_len, NULL, 0,
+                    (const byte *)k[i].info, (word32)strlen(k[i].info),
+                    k[i].key, PQIOT_KEY_SZ) != 0)
+            return PQIOT_ERR;
 
     return 0;
 }
@@ -220,6 +221,30 @@ int pqiot_recv(int fd, uint8_t *type, uint8_t *body, size_t cap, size_t *len)
     *type = hdr[4];
     *len  = blen;
     return 0;
+}
+
+int pqiot_send_sealed(int fd, const uint8_t key[PQIOT_KEY_SZ], uint8_t type,
+                      const uint8_t *pt, size_t ptlen)
+{
+    uint8_t frame[PQIOT_MAX_BODY];
+    size_t len;
+
+    if (pqiot_seal(key, pt, ptlen, frame, sizeof(frame), &len) != 0)
+        return PQIOT_ERR;
+    return pqiot_send(fd, type, frame, len);
+}
+
+int pqiot_recv_sealed(int fd, const uint8_t key[PQIOT_KEY_SZ], uint8_t want,
+                      uint8_t *pt, size_t ptcap, size_t *ptlen)
+{
+    uint8_t frame[PQIOT_MAX_BODY];
+    uint8_t type;
+    size_t len;
+
+    if (pqiot_recv(fd, &type, frame, sizeof(frame), &len) != 0 ||
+        type != want)
+        return PQIOT_ERR;
+    return pqiot_open(key, frame, len, pt, ptcap, ptlen);
 }
 
 const char *pqiot_msg_name(uint8_t type)
