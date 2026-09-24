@@ -8,6 +8,11 @@ secret keys **AES-256-GCM** for the actual payload. Both sides prove who they
 are with **ML-DSA-65** (Dilithium) certificates. Built on
 [wolfSSL](https://www.wolfssl.com/).
 
+The device runs **bare-metal on RISC-V** (a LiteX VexRiscv SoC simulated with
+Verilator, no OS) and talks over the simulated SoC's Ethernet to the server
+on the host. The same session code also runs natively, under Linux on
+RISC-V, and over TLS/DTLS 1.3.
+
 ## Build
 
 ```bash
@@ -99,10 +104,101 @@ If you can't log out, `newgrp wireshark` opens a shell that already has the
 group. Don't use `sudo make capture`: tshark running as root fails to write
 the pcap.
 
-## RISC-V target
+## Bare-metal RISC-V
 
-The device side is meant for small hardware, so it also builds for
-**riscv64** and runs under QEMU user-mode emulation. Needs
+This is the problem statement's target platform: a **LiteX SoC with a
+32-bit VexRiscv CPU** (100 MB RAM, 1 MHz nominal clock) simulated
+cycle-accurately with Verilator, running firmware with **no operating
+system**. It's the same SoC as the reference environment,
+[QTrino-Labs/Constraint_Env_Sim](https://github.com/QTrino-Labs-Pvt-Ltd/Constraint_Env_Sim).
+
+```bash
+make fw-demo       # device and server both on the bare-metal CPU
+make fw-net-demo   # bare-metal device on the simulated Ethernet <-> host server
+CAPTURE=1 make fw-net-demo   # ... and record/check tap0 -> demo-fw-net.pcap
+```
+
+```
+[fw] PQIOT/2 bare-metal device on VexRiscv_Full @ 1000000 Hz, no OS
+[fw] ethernet up: 192.168.1.50 -> bridge 192.168.1.100:4433
+[device] -> KEMCT    1088 bytes (ML-KEM cipher text)
+[device] <- CERT, VERIFY: server authenticated: CN=server.pqiot.test (ML-DSA-65)
+[device] <- DATA     51 bytes -> decrypted: "ack: telemetry received"
+[fw] whole session: 142809619 cycles
+PQIOT bare-metal demo: OK
+  [server] <- CERT, VERIFY: device authenticated: CN=device-0001.pqiot.test (ML-DSA-65)
+```
+
+Each target builds the firmware, simulates the SoC and exits with the
+firmware's verdict, in about two to three minutes of real time.
+
+- **`fw-demo`** runs one full session with **both ends on the RISC-V CPU**.
+  They are two cooperative threads (a small assembly context switch,
+  `firmware/switch.S`) exchanging messages through in-memory pipes. The whole
+  session takes 280–295 M cycles, about 5 minutes of simulated time at
+  1 MHz. The count varies between builds because each image has its own
+  seed, and ML-DSA signing retries a random number of times.
+- **`fw-net-demo`** runs **only the device** on the SoC, with its Ethernet
+  MAC on the host's `tap0`. It talks to the **unmodified native
+  `pqiot-server`**, which can't tell it from the Linux client. The device
+  side takes about 143 M cycles. The run passes only if the device, the
+  server and the bridge all succeed.
+- **Same protocol code.** Both images run `src/session.c` and `src/pqiot.c`,
+  the code the Linux binaries use. Only the transport underneath differs:
+  pipes in `firmware/pipes.c`, UDP in `firmware/udp_stream.c`, sockets in
+  `src/pqiot_posix.c`.
+- **Networking.** LiteX's bare-metal network stack (`libliteeth`) has UDP
+  but no TCP, and PQIOT messages are up to about 8.9 KB. So
+  `firmware/udp_stream.c` carries the byte stream in 1 KB chunks, with
+  stop-and-wait acknowledgements and retransmission. `tools/udp-bridge.py`
+  on the host relays it to the server over TCP. The bridge only moves bytes:
+  it holds no keys and can't read the session. It was tested with 20%
+  packet loss in both directions.
+- **wolfSSL** is compiled from the same pinned v5.9.2 source, configured by
+  `firmware/user_settings.h` with the same algorithms as the host build. The
+  image is about 270 KB. The device-only image carries the CA and the
+  device's key, never the server's.
+
+**Setup**, once (Arch package names):
+
+```bash
+sudo pacman -S --needed verilator riscv64-elf-gcc riscv64-elf-newlib riscv64-elf-binutils
+```
+```bash
+mkdir -p ~/litex && cd ~/litex && python3 -m venv venv && . venv/bin/activate && pip install meson ninja && curl -fsSLO https://raw.githubusercontent.com/enjoy-digital/litex/master/litex_setup.py && python3 litex_setup.py --init --install --config=standard
+```
+
+The Makefile looks for LiteX in `~/litex/venv` (override with
+`LITEX_VENV=...`). `fw-net-demo` also needs a `tap0` interface that you own,
+created once with root:
+
+```bash
+sudo ip tuntap add dev tap0 mode tap user "$USER"
+```
+```bash
+sudo ip addr add 192.168.1.100/24 dev tap0
+```
+```bash
+sudo ip link set tap0 up
+```
+
+`litex_sim` normally runs any Ethernet simulation under `sudo`, because it
+may have to create the tap device. Since `tap0` already exists and is yours,
+`tools/fw-net-demo.sh` runs the simulation unprivileged.
+
+**No hardware random source or clock.** The simulated SoC has neither, and
+a simulation is deterministic anyway. Each image therefore gets a 32-byte
+DRBG seed drawn from the build host's `/dev/urandom`, stretched with SHA-256
+(`firmware/platform.c`). The limitation is that every boot of one image
+replays the same randomness, so rebuild for fresh keys, and real hardware
+must feed a TRNG into `pqiot_fw_seed`. The reference firmware's placeholder
+generator (`i*37+123`) isn't random at all. Certificate dates are checked
+against the image's build time.
+
+## RISC-V under Linux (QEMU user mode)
+
+The device side also builds for **riscv64 Linux** and runs under QEMU
+user-mode emulation. Needs
 `riscv64-linux-gnu-gcc` and `qemu-riscv64` (Arch: `riscv64-linux-gnu-gcc`,
 `qemu-user`).
 
@@ -275,10 +371,12 @@ make tls-capture   # under tshark -> demo-tls.pcap
 
 ```
 src/pqiot.h      protocol constants and wire format
-src/pqiot.c      KEM, AEAD, framing, transcript, ML-DSA auth (shared)
+src/pqiot.c      KEM, AEAD, framing, transcript, ML-DSA auth (no OS calls)
+src/session.c    one PQIOT/2 session per role: the protocol itself
+src/pqiot_posix.c   sockets and PEM files behind pqiot.c's platform hooks
 src/pki.h        demo PKI paths and server name (both protocols)
-src/client.c     the IoT device — encapsulates, authenticates, encrypts
-src/server.c     holds the key pair — decapsulates, authenticates, decrypts
+src/client.c     the IoT device, TCP front end
+src/server.c     the server, TCP front end
 src/selftest.c   the assertions behind `make check`
 src/pqtls.h      TLS/DTLS 1.3 policy: group, certificates, peer key check
 src/tls_client.c the IoT device over TLS/DTLS 1.3
@@ -286,6 +384,16 @@ src/tls_server.c the server over TLS/DTLS 1.3
 tools/capture.sh packet capture and verification
 tools/tls-check.sh     OpenSSL interop and refusal cases
 tools/tls-capture.sh   TLS/DTLS capture: key share groups on the wire
+tools/fw-demo.sh       boot the bare-metal firmware, wait for its verdict
+tools/fw-net-demo.sh   bare-metal device + bridge + native server (+ capture)
+tools/udp-bridge.py    device's reliable UDP stream <-> TCP pqiot-server
+firmware/main.c        bare metal: device and server as coroutines
+firmware/main_net.c    bare metal: device only, over Ethernet
+firmware/pipes.c, udp_stream.c   the two bare-metal transports
+firmware/platform.c    DRBG seed and clock for bare metal
+firmware/switch.S      coroutine context switch (RV32/RV64)
+firmware/user_settings.h   wolfSSL configuration for bare metal
+firmware/linker.ld, certs.S, Makefile   image layout, embedded PKI, build
 ```
 
 ## Status
@@ -294,7 +402,10 @@ tools/tls-capture.sh   TLS/DTLS capture: key share groups on the wire
 - [x] ML-KEM-768 key exchange via wolfSSL
 - [x] AES-256-GCM payload encryption under the KEM-derived key
 - [x] Packet capture + verification script
-- [x] RISC-V emulator target (riscv64 under qemu-user)
+- [x] Bare-metal RISC-V (LiteX VexRiscv under Verilator, no OS): full
+      session on-chip, and a bare-metal device over simulated Ethernet to
+      the native server
+- [x] RISC-V Linux target (riscv64 under qemu-user)
 - [x] TLS/DTLS 1.3 integration (X25519MLKEM768 hybrid key exchange)
 - [x] ML-DSA mutual authentication (ML-DSA-65 certificates, PQIOT/2 and
       TLS/DTLS 1.3)
@@ -307,6 +418,10 @@ tools/tls-capture.sh   TLS/DTLS capture: key share groups on the wire
   revocation (CRL/OCSP) or enrolment of new devices.
 - **Servers are single-session.** Each binary serves one device, then
   exits.
+- **No entropy source on bare metal.** Each firmware image replays its build
+  seed's randomness on every boot (see Bare-metal RISC-V).
+- **Stop-and-wait over UDP.** The bare-metal stream acknowledges every 1 KB
+  chunk: fine for a ~20 KB handshake, slow for bulk data.
 - **PQIOT/2 checks only the certificate's CN.** It doesn't read the SAN;
   our certificates put the same name in both.
 - **ECC is still compiled into wolfSSL.** v5.9.2 won't build without it.
