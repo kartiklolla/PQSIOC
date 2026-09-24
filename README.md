@@ -85,16 +85,18 @@ The device side is meant for small hardware, so it also builds for
 `qemu-user`).
 
 ```bash
-make riscv         # cross-build pqiot-*.rv64 (static)
-make riscv-check   # self-check under qemu-riscv64
-make riscv-demo    # emulated RISC-V device <-> native x86-64 server
-make riscv-capture # same, under tshark -> demo-riscv.pcap
+make riscv             # cross-build pqiot-*.rv64 and pqtls-*.rv64 (static)
+make riscv-check       # self-check under qemu-riscv64
+make riscv-demo        # emulated RISC-V device <-> native x86-64 server
+make riscv-capture     # same, under tshark -> demo-riscv.pcap
+make riscv-tls-demo    # same over TLS 1.3 and DTLS 1.3
+make riscv-tls-capture # same, under tshark -> demo-riscv-tls.pcap
 ```
 
 wolfSSL isn't packaged for riscv64, so the first `make riscv` clones
 `v5.9.2-stable` (the same version as the host library) into `build/` and
-cross-builds a static wolfCrypt with ML-KEM, HKDF and AES-GCM. Later builds
-reuse it; `make distclean` removes it.
+cross-builds a static wolfSSL (see [TLS / DTLS 1.3](#tls--dtls-13) for the
+feature set). Later builds reuse it; `make distclean` removes it.
 
 `riscv-demo` runs the RISC-V client against the **native** server. The
 handshake only completes if both architectures derive the same ML-KEM shared
@@ -128,13 +130,51 @@ into one key per direction (`"PQIOT/1 c2s"` and `"PQIOT/1 s2c"`), so the two
 sides can never collide on a (key, IV) pair. Each `DATA` message gets a fresh
 random 96-bit IV, since GCM breaks catastrophically if one is reused.
 
-### Why raw sockets rather than TLS
+### Why PQIOT/1 as well as TLS
 
 The KEM is the point of the exercise, and on a raw socket the ML-KEM cipher
-text sits on the wire where a capture can show it plainly. Under TLS it would
-be buried in a handshake — and this wolfSSL build sets
-`WOLFSSL_TLS_NO_MLKEM_STANDALONE`, so TLS would only offer *hybrid* groups
-anyway. TLS/DTLS 1.3 is tracked below as a stretch goal.
+text sits on the wire where a capture can show it plainly. Under TLS it is
+inside a hybrid key share in the handshake. The TLS endpoints below are the
+standards-based version of the same channel.
+
+## TLS / DTLS 1.3
+
+`pqtls-server` and `pqtls-client` carry the same device session over
+standard **TLS 1.3** (TCP) or, with `--dtls`, **DTLS 1.3** (UDP, the usual
+choice for constrained devices, e.g. under CoAP). Key exchange is pinned to
+**X25519MLKEM768**, the hybrid group current TLS stacks deploy: the session
+key stays safe unless *both* X25519 and ML-KEM-768 are broken. Neither side
+offers any other group, so there is no classical key exchange to downgrade to.
+
+```bash
+make tls           # endpoints + a demo CA and server certificate
+make tls-demo      # one TLS 1.3 session, then one DTLS 1.3 session
+make tls-check     # interop with OpenSSL, both ways; refuse classical peers
+make tls-capture   # under tshark -> demo-tls.pcap
+```
+
+```
+[device] handshake OK: DTLSv1.3, TLS_AES_256_GCM_SHA384, key exchange X25519MLKEM768
+```
+
+- **wolfSSL from source.** The system wolfSSL has no DTLS, so `make tls`
+  builds v5.9.2 into `build/host`, with TLS 1.3, DTLS 1.3, ML-KEM and
+  Curve25519. The same recipe builds `build/riscv`. `--enable-dtls-frag-ch`
+  is needed because a ClientHello carrying the 1216-byte hybrid key share
+  can be larger than one datagram. The PQIOT/1 binaries still use the system
+  library.
+- **Server authentication is classical.** `make certs` creates a
+  throwaway ECDSA P-256 CA and a certificate for `server.pqiot.test` in
+  `build/certs`. The client verifies the chain and the name. Replacing ECDSA
+  with ML-DSA is the separate stretch goal below.
+- **`tls-check`** runs against OpenSSL (≥ 3.5, which has X25519MLKEM768):
+  OpenSSL's client talks to our server, and our client talks to OpenSSL's
+  server. It also checks that each of our endpoints refuses an OpenSSL peer
+  that offers only X25519. OpenSSL has no DTLS 1.3, so this covers TLS only.
+- **`tls-capture`** reads the handshakes from the pcap and fails unless every
+  group offered, supported or chosen, in both the TLS and DTLS hellos, is
+  X25519MLKEM768 (`0x11ec`). It also checks that the plaintext appears in no
+  packet.
 
 ## Layout
 
@@ -144,7 +184,12 @@ src/pqiot.c      KEM helpers, AEAD, framed socket I/O   (shared)
 src/client.c     the IoT device — encapsulates, encrypts
 src/server.c     holds the key pair — decapsulates, decrypts
 src/selftest.c   the assertions behind `make check`
+src/pqtls.h      TLS/DTLS 1.3 settings: group, certificate paths
+src/tls_client.c the IoT device over TLS/DTLS 1.3
+src/tls_server.c the server over TLS/DTLS 1.3
 tools/capture.sh packet capture and verification
+tools/tls-check.sh     OpenSSL interop and downgrade refusal
+tools/tls-capture.sh   TLS/DTLS capture: key share groups on the wire
 ```
 
 ## Status
@@ -154,6 +199,6 @@ tools/capture.sh packet capture and verification
 - [x] AES-256-GCM payload encryption under the KEM-derived key
 - [x] Packet capture + verification script
 - [x] RISC-V emulator target (riscv64 under qemu-user)
-- [ ] TLS/DTLS 1.3 integration *(stretch)*
+- [x] TLS/DTLS 1.3 integration (X25519MLKEM768 hybrid key exchange)
 - [ ] ML-DSA mutual authentication *(stretch — needs wolfSSL rebuilt with
       `--enable-dilithium`; the system build has `WOLFSSL_HAVE_MLDSA` off)*
