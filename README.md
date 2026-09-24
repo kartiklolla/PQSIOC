@@ -73,6 +73,28 @@ once and log back in:
 sudo usermod -aG wireshark "$USER"
 ```
 
+## RISC-V target
+
+The device side is meant for small hardware, so it also builds for
+**riscv64** and runs under QEMU user-mode emulation. Needs
+`riscv64-linux-gnu-gcc` and `qemu-riscv64` (Arch: `riscv64-linux-gnu-gcc`,
+`qemu-user`).
+
+```bash
+make riscv         # cross-build pqiot-*.rv64 (static)
+make riscv-check   # self-check under qemu-riscv64
+make riscv-demo    # emulated RISC-V device <-> native x86-64 server
+```
+
+wolfSSL isn't packaged for riscv64, so the first `make riscv` clones
+`v5.9.2-stable` (the same version as the host library) into `build/` and
+cross-builds a static wolfCrypt with ML-KEM, HKDF and AES-GCM. Later builds
+reuse it; `make distclean` removes it.
+
+`riscv-demo` runs the RISC-V client against the **native** server. The
+handshake only completes if both architectures derive the same ML-KEM shared
+secret, so a passing run shows the two builds interoperate.
+
 ## Protocol — PQIOT/1
 
 Three message types over TCP. Every message carries an 8-byte header, so
@@ -126,7 +148,7 @@ tools/capture.sh packet capture and verification
 - [x] ML-KEM-768 key exchange via wolfSSL
 - [x] AES-256-GCM payload encryption under the KEM-derived key
 - [x] Packet capture + verification script
-- [ ] RISC-V emulator target
+- [x] RISC-V emulator target (riscv64 under qemu-user)
 - [ ] TLS/DTLS 1.3 integration *(stretch)*
 - [ ] ML-DSA mutual authentication *(stretch — needs wolfSSL rebuilt with
       `--enable-dilithium`; the system build has `WOLFSSL_HAVE_MLDSA` off)*
