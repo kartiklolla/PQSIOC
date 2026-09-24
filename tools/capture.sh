@@ -4,21 +4,28 @@
 #
 #   tools/capture.sh [port] [message]
 #
+# CLIENT picks the device binary, e.g. the emulated RISC-V build:
+#   CLIENT="qemu-riscv64 ./pqiot-client.rv64" OUT=demo-riscv.pcap tools/capture.sh
+#
 # Loopback capture needs privileges. Either add yourself to the wireshark
 # group once (then re-login):
 #     sudo usermod -aG wireshark "$USER"
-# or run this script under sudo.
+# If a re-login isn't practical (e.g. a long-running terminal app), a
+# `newgrp wireshark` shell picks the group up immediately.
+# Running under sudo doesn't work: tshark as root fails to write the pcap.
 
 set -e
 
 PORT=${1:-4433}
 MSG=${2:-sensor=temp value=23.4C}
 OUT=${OUT:-demo.pcap}
+CLIENT=${CLIENT:-./pqiot-client}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 
 cd "$ROOT"
 
-if [ ! -x ./pqiot-server ] || [ ! -x ./pqiot-client ]; then
+# Last word of CLIENT is the binary; anything before it is a wrapper (qemu).
+if [ ! -x ./pqiot-server ] || [ ! -x "${CLIENT##* }" ]; then
     echo "capture: build first (make)" >&2
     exit 1
 fi
@@ -28,7 +35,7 @@ fi
 if ! dumpcap -D >/dev/null 2>&1; then
     echo "capture: no permission to capture on loopback." >&2
     echo "  fix:  sudo usermod -aG wireshark \"\$USER\"   (then log out and back in)" >&2
-    echo "  or:   sudo tools/capture.sh $PORT" >&2
+    echo "  or, if already in the group:  newgrp wireshark   (then re-run)" >&2
     exit 1
 fi
 
@@ -47,7 +54,7 @@ echo "== running session"
 ./pqiot-server "$PORT" &
 SRV=$!
 sleep 0.5
-./pqiot-client 127.0.0.1 "$PORT" "$MSG"
+$CLIENT 127.0.0.1 "$PORT" "$MSG"
 wait $SRV
 
 sleep 1

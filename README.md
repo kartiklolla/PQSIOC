@@ -73,6 +73,10 @@ once and log back in:
 sudo usermod -aG wireshark "$USER"
 ```
 
+If you can't log out, `newgrp wireshark` opens a shell that already has the
+group. Don't use `sudo make capture`: tshark running as root fails to write
+the pcap.
+
 ## RISC-V target
 
 The device side is meant for small hardware, so it also builds for
@@ -84,6 +88,7 @@ The device side is meant for small hardware, so it also builds for
 make riscv         # cross-build pqiot-*.rv64 (static)
 make riscv-check   # self-check under qemu-riscv64
 make riscv-demo    # emulated RISC-V device <-> native x86-64 server
+make riscv-capture # same, under tshark -> demo-riscv.pcap
 ```
 
 wolfSSL isn't packaged for riscv64, so the first `make riscv` clones

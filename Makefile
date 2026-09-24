@@ -8,6 +8,7 @@
 #   make riscv        cross-build all three for riscv64 (static)
 #   make riscv-check  run the self-check under qemu-riscv64
 #   make riscv-demo   RISC-V device (qemu) talking to the native server
+#   make riscv-capture  riscv-demo under tshark, writing demo-riscv.pcap
 
 CC      ?= cc
 # -D_GNU_SOURCE: memmem() in the self-check.
@@ -101,11 +102,15 @@ riscv-demo: pqiot-server pqiot-client.rv64
 	 wait $$srv || rc=1; \
 	 exit $$rc
 
+riscv-capture: pqiot-server pqiot-client.rv64
+	@CLIENT="$(QEMU) ./pqiot-client.rv64" OUT=demo-riscv.pcap \
+	 tools/capture.sh $(PORT) "$(MSG)"
+
 clean:
-	rm -f $(BINS) $(OBJS) $(RV_BINS) $(RV_OBJS) demo.pcap
+	rm -f $(BINS) $(OBJS) $(RV_BINS) $(RV_OBJS) demo.pcap demo-riscv.pcap
 
 # Also drops the cross-built wolfSSL; the next `make riscv` rebuilds it.
 distclean: clean
 	rm -rf build
 
-.PHONY: all check demo capture riscv riscv-check riscv-demo clean distclean
+.PHONY: all check demo capture riscv riscv-check riscv-demo riscv-capture clean distclean
