@@ -213,13 +213,15 @@ static void test_auth(void)
     size_t siglen, dsiglen, ecdsa_len;
     char cn[256];
 
-    assert(pqiot_identity_load(&server, PKI_SERVER_CERT_FILE, PKI_SERVER_KEY_FILE) == 0);
-    assert(pqiot_identity_load(&device, PKI_DEVICE_CERT_FILE, PKI_DEVICE_KEY_FILE) == 0);
+    assert(pqiot_identity_load(&server, PKI_SERVER_CERT_FILE, PKI_SERVER_KEY_FILE,
+                               PKI_CA_FILE) == 0);
+    assert(pqiot_identity_load(&device, PKI_DEVICE_CERT_FILE, PKI_DEVICE_KEY_FILE,
+                               PKI_CA_FILE) == 0);
     assert(pqiot_identity_load(&rogue, "build/certs/bad/rogue.pem",
-                               "build/certs/bad/rogue.key") == 0);
+                               "build/certs/bad/rogue.key", PKI_CA_FILE) == 0);
     /* An ECDSA key is not an identity we can even load. */
     assert(pqiot_identity_load(&(pqiot_identity){0}, "build/certs/bad/ecdsa-srv.pem",
-                               "build/certs/bad/ecdsa-srv.key") != 0);
+                               "build/certs/bad/ecdsa-srv.key", PKI_CA_FILE) != 0);
 
     assert(wc_InitSha256(&th) == 0);
     assert(pqiot_transcript_add(&th, PQIOT_MSG_PUBKEY, kem_pub, sizeof(kem_pub)) == 0);
@@ -229,7 +231,7 @@ static void test_auth(void)
     assert(siglen == PQIOT_SIG_SZ);
 
     /* The genuine server, as the device sees it. */
-    assert(pqiot_auth_verify(PKI_CA_FILE, server.cert, server.cert_len,
+    assert(pqiot_auth_verify(&server, server.cert, server.cert_len,
                              PKI_SERVER_NAME, &th, PQIOT_ROLE_SERVER,
                              sig, siglen, cn, sizeof(cn)) == 0);
     assert(strcmp(cn, PKI_SERVER_NAME) == 0);
@@ -240,18 +242,18 @@ static void test_auth(void)
     assert(pqiot_transcript_add(&other, PQIOT_MSG_PUBKEY, kem_pub, sizeof(kem_pub)) == 0);
     assert(pqiot_transcript_add(&other, PQIOT_MSG_KEMCT, kem_pub, sizeof(kem_pub)) == 0);
     assert(pqiot_transcript_add(&other, PQIOT_MSG_CERT, server.cert, server.cert_len) == 0);
-    assert(pqiot_auth_verify(PKI_CA_FILE, server.cert, server.cert_len,
+    assert(pqiot_auth_verify(&server, server.cert, server.cert_len,
                              PKI_SERVER_NAME, &other, PQIOT_ROLE_SERVER,
                              sig, siglen, cn, sizeof(cn)) != 0);
 
     /* The server's signature replayed as if it were a device's. */
-    assert(pqiot_auth_verify(PKI_CA_FILE, server.cert, server.cert_len, NULL,
+    assert(pqiot_auth_verify(&server, server.cert, server.cert_len, NULL,
                              &th, PQIOT_ROLE_DEVICE, sig, siglen,
                              cn, sizeof(cn)) != 0);
 
     /* One flipped bit in the signature. */
     sig[100] ^= 0x01;
-    assert(pqiot_auth_verify(PKI_CA_FILE, server.cert, server.cert_len,
+    assert(pqiot_auth_verify(&server, server.cert, server.cert_len,
                              PKI_SERVER_NAME, &th, PQIOT_ROLE_SERVER,
                              sig, siglen, cn, sizeof(cn)) != 0);
     sig[100] ^= 0x01;
@@ -259,32 +261,32 @@ static void test_auth(void)
     /* A genuine device posing as the server: valid CA, valid signature,
      * wrong name. */
     assert(pqiot_auth_sign(&device, &th, PQIOT_ROLE_SERVER, dsig, &dsiglen) == 0);
-    assert(pqiot_auth_verify(PKI_CA_FILE, device.cert, device.cert_len,
+    assert(pqiot_auth_verify(&server, device.cert, device.cert_len,
                              PKI_SERVER_NAME, &th, PQIOT_ROLE_SERVER,
                              dsig, dsiglen, cn, sizeof(cn)) != 0);
 
     /* The genuine device, as the server sees it (any CN from the CA). */
     assert(pqiot_auth_sign(&device, &th, PQIOT_ROLE_DEVICE, dsig, &dsiglen) == 0);
-    assert(pqiot_auth_verify(PKI_CA_FILE, device.cert, device.cert_len, NULL,
+    assert(pqiot_auth_verify(&server, device.cert, device.cert_len, NULL,
                              &th, PQIOT_ROLE_DEVICE, dsig, dsiglen,
                              cn, sizeof(cn)) == 0);
     assert(strcmp(cn, "device-0001.pqiot.test") == 0);
 
     /* Right name, valid signature, but the certificate is from another CA. */
     assert(pqiot_auth_sign(&rogue, &th, PQIOT_ROLE_SERVER, sig, &siglen) == 0);
-    assert(pqiot_auth_verify(PKI_CA_FILE, rogue.cert, rogue.cert_len,
+    assert(pqiot_auth_verify(&server, rogue.cert, rogue.cert_len,
                              PKI_SERVER_NAME, &th, PQIOT_ROLE_SERVER,
                              sig, siglen, cn, sizeof(cn)) != 0);
 
     /* Our own CA, right name, but a classical (ECDSA) key. */
     ecdsa_len = cert_der("build/certs/bad/ecdsa-srv.pem", ecdsa, sizeof(ecdsa));
     assert(pqiot_auth_sign(&server, &th, PQIOT_ROLE_SERVER, sig, &siglen) == 0);
-    assert(pqiot_auth_verify(PKI_CA_FILE, ecdsa, ecdsa_len, PKI_SERVER_NAME,
+    assert(pqiot_auth_verify(&server, ecdsa, ecdsa_len, PKI_SERVER_NAME,
                              &th, PQIOT_ROLE_SERVER, sig, siglen,
                              cn, sizeof(cn)) != 0);
 
     /* Truncated certificate. */
-    assert(pqiot_auth_verify(PKI_CA_FILE, server.cert, server.cert_len / 2,
+    assert(pqiot_auth_verify(&server, server.cert, server.cert_len / 2,
                              PKI_SERVER_NAME, &th, PQIOT_ROLE_SERVER,
                              sig, siglen, cn, sizeof(cn)) != 0);
 

@@ -1,11 +1,16 @@
 #include "pqiot.h"
 
-#include <errno.h>
+/* No OS calls in here: socket and file access live behind the hooks in
+ * src/pqiot_posix.c, so this file also builds for bare metal. */
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
 
+/* Configure-built wolfSSL records its options here; the bare-metal build
+ * uses firmware/user_settings.h via -DWOLFSSL_USER_SETTINGS instead. */
+#ifndef WOLFSSL_USER_SETTINGS
 #include <wolfssl/options.h>
+#endif
+#include <wolfssl/wolfcrypt/settings.h>
 #include <wolfssl/ssl.h>
 #include <wolfssl/wolfcrypt/aes.h>
 #include <wolfssl/wolfcrypt/asn_public.h>
@@ -139,12 +144,9 @@ int pqiot_open(const uint8_t key[PQIOT_KEY_SZ], const uint8_t *in, size_t inlen,
 static int write_full(int fd, const uint8_t *buf, size_t len)
 {
     while (len > 0) {
-        ssize_t n = write(fd, buf, len);
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
+        long n = pqiot_sys_write(fd, buf, len);
+        if (n <= 0)
             return PQIOT_ERR;
-        }
         buf += n;
         len -= (size_t)n;
     }
@@ -154,14 +156,9 @@ static int write_full(int fd, const uint8_t *buf, size_t len)
 static int read_full(int fd, uint8_t *buf, size_t len)
 {
     while (len > 0) {
-        ssize_t n = read(fd, buf, len);
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            return PQIOT_ERR;
-        }
-        if (n == 0)
-            return PQIOT_ERR; /* peer closed mid-frame */
+        long n = pqiot_sys_read(fd, buf, len);
+        if (n <= 0)
+            return PQIOT_ERR; /* error, or peer closed mid-frame */
         buf += n;
         len -= (size_t)n;
     }
@@ -261,45 +258,33 @@ const char *pqiot_msg_name(uint8_t type)
 
 /* ---- authentication ---------------------------------------------------- */
 
-/* Whole file into buf. Its length, or -1. */
-static int read_file(const char *path, uint8_t *buf, size_t cap)
+int pqiot_identity_parse(pqiot_identity *id,
+                         const uint8_t *cert_pem, size_t cert_len,
+                         const uint8_t *key_pem, size_t key_len,
+                         const uint8_t *ca_pem, size_t ca_len)
 {
-    FILE *f = fopen(path, "rb");
-    size_t n;
-
-    if (f == NULL)
-        return PQIOT_ERR;
-    n = fread(buf, 1, cap, f);
-    /* A file that fills the buffer may have been cut short. */
-    if (ferror(f) || n == cap) {
-        fclose(f);
-        return PQIOT_ERR;
-    }
-    fclose(f);
-    return (int)n;
-}
-
-int pqiot_identity_load(pqiot_identity *id, const char *cert_file,
-                        const char *key_file)
-{
-    uint8_t pem[16384], der[8192];
+    uint8_t der[8192];
     word32 idx = 0;
-    int n, len, rc = PQIOT_ERR;
+    int len, rc = PQIOT_ERR;
 
-    if (id == NULL || cert_file == NULL || key_file == NULL)
+    if (id == NULL || cert_pem == NULL || key_pem == NULL || ca_pem == NULL)
         return PQIOT_ERR;
     if (wc_MlDsaKey_Init(&id->key, NULL, INVALID_DEVID) != 0)
         return PQIOT_ERR;
 
-    n = read_file(cert_file, pem, sizeof(pem));
-    len = n < 0 ? n : wc_CertPemToDer(pem, n, id->cert, sizeof(id->cert),
-                                      CERT_TYPE);
+    len = wc_CertPemToDer(cert_pem, (int)cert_len, id->cert, sizeof(id->cert),
+                          CERT_TYPE);
     if (len <= 0)
         goto out;
     id->cert_len = (size_t)len;
 
-    n = read_file(key_file, pem, sizeof(pem));
-    len = n < 0 ? n : wc_KeyPemToDer(pem, n, der, sizeof(der), NULL);
+    len = wc_CertPemToDer(ca_pem, (int)ca_len, id->ca, sizeof(id->ca),
+                          CERT_TYPE);
+    if (len <= 0)
+        goto out;
+    id->ca_len = (size_t)len;
+
+    len = wc_KeyPemToDer(key_pem, (int)key_len, der, sizeof(der), NULL);
     if (len <= 0 ||
         wc_MlDsaKey_SetParams(&id->key, WC_ML_DSA_65) != 0 ||
         wc_MlDsaKey_PrivateKeyDecode(&id->key, der, (word32)len, &idx) != 0)
@@ -307,9 +292,7 @@ int pqiot_identity_load(pqiot_identity *id, const char *cert_file,
 
     rc = 0;
 out:
-    /* Both buffers held the private key at some point. */
-    wc_ForceZero(pem, sizeof(pem));
-    wc_ForceZero(der, sizeof(der));
+    wc_ForceZero(der, sizeof(der)); /* held the private key */
     if (rc != 0)
         wc_MlDsaKey_Free(&id->key);
     return rc;
@@ -359,7 +342,7 @@ int pqiot_auth_sign(pqiot_identity *id, wc_Sha256 *th, const char *role,
     return 0;
 }
 
-int pqiot_auth_verify(const char *ca_file, const uint8_t *cert,
+int pqiot_auth_verify(const pqiot_identity *self, const uint8_t *cert,
                       size_t cert_len, const char *want_cn, wc_Sha256 *th,
                       const char *role, const uint8_t *sig, size_t siglen,
                       char *cn, size_t cncap)
@@ -374,7 +357,7 @@ int pqiot_auth_verify(const char *ca_file, const uint8_t *cert,
     word32 idx = 0;
     int rc = PQIOT_ERR;
 
-    if (ca_file == NULL || cert == NULL || th == NULL || role == NULL ||
+    if (self == NULL || cert == NULL || th == NULL || role == NULL ||
         sig == NULL || cn == NULL || cncap == 0 ||
         cert_len == 0 || cert_len > PQIOT_MAX_BODY)
         return PQIOT_ERR;
@@ -383,7 +366,8 @@ int pqiot_auth_verify(const char *ca_file, const uint8_t *cert,
     /* 1. The certificate chains to our CA (signature, validity dates). */
     cm = wolfSSL_CertManagerNew();
     if (cm == NULL ||
-        wolfSSL_CertManagerLoadCA(cm, ca_file, NULL) != WOLFSSL_SUCCESS ||
+        wolfSSL_CertManagerLoadCABuffer(cm, self->ca, (long)self->ca_len,
+                                        WOLFSSL_FILETYPE_ASN1) != WOLFSSL_SUCCESS ||
         wolfSSL_CertManagerVerifyBuffer(cm, cert, (long)cert_len,
                                         WOLFSSL_FILETYPE_ASN1) != WOLFSSL_SUCCESS)
         goto out;

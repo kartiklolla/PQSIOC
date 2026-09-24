@@ -12,6 +12,12 @@
 #   make riscv-tls-demo RISC-V device over TLS and DTLS 1.3
 #   make riscv-tls-capture  riscv-tls-demo under tshark -> demo-riscv-tls.pcap
 #
+#   make fw           bare-metal RISC-V firmware (LiteX VexRiscv, no OS)
+#   make fw-demo      boot it in the LiteX/Verilator simulator: full PQIOT/2
+#                     session, device and server both on the bare-metal CPU
+#   make fw-net-demo  bare-metal device on the simulated Ethernet, talking to
+#                     the native pqiot-server (needs tap0, see README)
+#
 #   make tls          TLS/DTLS 1.3 endpoints (X25519MLKEM768), + demo certs
 #   make tls-demo     one TLS session, then one DTLS session
 #   make tls-check    interop with OpenSSL, plus refusal cases
@@ -40,17 +46,20 @@ PORT ?= 4433
 MSG  ?= sensor=temp value=23.4C
 
 BINS := pqiot-server pqiot-client pqiot-selftest
-OBJS := src/pqiot.o src/server.o src/client.o src/selftest.o
+OBJS := src/pqiot.o src/pqiot_posix.o src/session.o \
+        src/server.o src/client.o src/selftest.o
+# Shared by every native binary: protocol core + the POSIX platform hooks.
+CORE := src/pqiot.o src/pqiot_posix.o
 
 all: $(BINS)
 
-pqiot-server: src/server.o src/pqiot.o
+pqiot-server: src/server.o src/session.o $(CORE)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-pqiot-client: src/client.o src/pqiot.o
+pqiot-client: src/client.o src/session.o $(CORE)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-pqiot-selftest: src/selftest.o src/pqiot.o
+pqiot-selftest: src/selftest.o $(CORE)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 src/%.o: src/%.c src/pqiot.h src/pki.h
@@ -205,7 +214,8 @@ build/rv64/%.o: src/%.c src/pqiot.h src/pqtls.h src/pki.h $(RV_LIB)
 	@mkdir -p $(@D)
 	$(RV_CC) $(RV_CFLAGS) -c -o $@ $<
 
-$(PQ_RV_BINS): pqiot-%.rv64: build/rv64/%.o build/rv64/pqiot.o
+RV_CORE := build/rv64/pqiot.o build/rv64/pqiot_posix.o build/rv64/session.o
+$(PQ_RV_BINS): pqiot-%.rv64: build/rv64/%.o $(RV_CORE)
 	$(RV_CC) $(RV_CFLAGS) -static -o $@ $^ $(RV_LIB) -lm
 
 $(TLS_RV_BINS): pqtls-%.rv64: build/rv64/tls_%.o
@@ -240,6 +250,53 @@ riscv-tls-capture: tls pqtls-client.rv64
 	@CLIENT="$(QEMU) ./pqtls-client.rv64" OUT=demo-riscv-tls.pcap \
 	 tools/tls-capture.sh $(PORT) "$(MSG)"
 
+# --- bare-metal RISC-V (LiteX VexRiscv simulator) -------------------------
+# The PS's target platform: no OS at all. The SoC is the one the reference
+# environment (QTrino-Labs/Constraint_Env_Sim) simulates. Needs LiteX in
+# LITEX_VENV (see README), verilator, and riscv64-elf-gcc.
+LITEX_VENV  ?= $(HOME)/litex/venv
+LITEX_SIM   := $(LITEX_VENV)/bin/litex_sim
+FW_SIM_DIR  := build/litex-sim
+FW_SIM_ARGS := --cpu-type=vexriscv --cpu-variant=full \
+               --integrated-main-ram-size=0x06400000 --libc-mode=full \
+               --output-dir=$(CURDIR)/$(FW_SIM_DIR)
+FW_SOC      := $(FW_SIM_DIR)/software/include/generated/variables.mak
+FW_BIN      := build/fw/pqiot-fw.bin
+
+# The SoC's headers, libc and support libraries (no gateware yet).
+$(FW_SOC):
+	PATH=$(LITEX_VENV)/bin:$$PATH $(LITEX_SIM) $(FW_SIM_ARGS) --no-compile-gateware
+
+fw: $(FW_SOC) $(CERTS) | $(WOLF_SRC)
+	PATH=$(LITEX_VENV)/bin:$$PATH $(MAKE) -C firmware \
+	    BUILD_DIR=$(CURDIR)/$(FW_SIM_DIR)
+
+fw-demo: fw
+	@LITEX_SIM="$(LITEX_SIM)" FW_SIM_ARGS="$(FW_SIM_ARGS)" \
+	 tools/fw-demo.sh $(FW_BIN)
+
+# Same SoC plus an Ethernet MAC on the host's tap0: 192.168.1.50 on the SoC,
+# 192.168.1.100 on the host (litex_sim's defaults).
+FW_NET_SIM_DIR  := build/litex-sim-eth
+FW_NET_SIM_ARGS := $(subst $(FW_SIM_DIR),$(FW_NET_SIM_DIR),$(FW_SIM_ARGS)) \
+                   --with-ethernet
+FW_NET_SOC      := $(FW_NET_SIM_DIR)/software/include/generated/variables.mak
+FW_NET_BIN      := build/fw-net/pqiot-fw-net.bin
+
+$(FW_NET_SOC):
+	PATH=$(LITEX_VENV)/bin:$$PATH $(LITEX_SIM) $(FW_NET_SIM_ARGS) --no-compile-gateware
+
+fw-net: $(FW_NET_SOC) $(CERTS) | $(WOLF_SRC)
+	PATH=$(LITEX_VENV)/bin:$$PATH $(MAKE) -C firmware NET=1 \
+	    BUILD_DIR=$(CURDIR)/$(FW_NET_SIM_DIR)
+
+# pqiot-server on TCP $(FW_NET_PORT), the UDP<->TCP bridge on tap0, then the
+# simulated device; passes only if the device *and* the server both succeed.
+FW_NET_PORT ?= 4434
+fw-net-demo: fw-net pqiot-server
+	@LITEX_SIM="$(LITEX_SIM)" FW_SIM_ARGS="$(FW_NET_SIM_ARGS)" \
+	 SERVER_PORT=$(FW_NET_PORT) tools/fw-net-demo.sh $(FW_NET_BIN)
+
 clean:
 	rm -f $(BINS) $(OBJS) $(TLS_BINS) $(TLS_OBJS) $(RV_BINS) $(RV_OBJS) \
 	      demo.pcap demo-riscv.pcap demo-tls.pcap demo-riscv-tls.pcap
@@ -248,7 +305,7 @@ clean:
 distclean: clean
 	rm -rf build
 
-.PHONY: all check demo capture certs tls tls-demo tls-check tls-capture \
+.PHONY: all check demo capture certs tls tls-demo tls-check tls-capture fw fw-demo fw-net fw-net-demo \
         riscv riscv-check riscv-demo riscv-capture riscv-tls-demo \
         riscv-tls-capture \
         clean distclean

@@ -42,7 +42,12 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* Configure-built wolfSSL records its options here; the bare-metal build
+ * uses firmware/user_settings.h via -DWOLFSSL_USER_SETTINGS instead. */
+#ifndef WOLFSSL_USER_SETTINGS
 #include <wolfssl/options.h>
+#endif
+#include <wolfssl/wolfcrypt/settings.h>
 #include <wolfssl/wolfcrypt/random.h>
 #include <wolfssl/wolfcrypt/wc_mlkem.h>
 #include <wolfssl/wolfcrypt/wc_mldsa.h>
@@ -126,17 +131,25 @@ int pqiot_send_sealed(int fd, const uint8_t key[PQIOT_KEY_SZ], uint8_t type,
 int pqiot_recv_sealed(int fd, const uint8_t key[PQIOT_KEY_SZ], uint8_t want,
                       uint8_t *pt, size_t ptcap, size_t *ptlen);
 
-/* Our side of the authentication: a certificate from the demo CA and its
- * ML-DSA-65 signing key. */
+/* Our side of the authentication: a certificate from the demo CA, its
+ * ML-DSA-65 signing key, and the CA we check the peer against. */
 typedef struct {
     uint8_t     cert[PQIOT_MAX_BODY]; /* DER, sent as-is in CERT */
     size_t      cert_len;
     wc_MlDsaKey key;
+    uint8_t     ca[PQIOT_MAX_BODY];   /* DER trust anchor */
+    size_t      ca_len;
 } pqiot_identity;
 
-/* Load a PEM certificate and its PEM private key. */
+/* Build an identity from PEM text in memory: our certificate, its private
+ * key, and the CA certificate. */
+int pqiot_identity_parse(pqiot_identity *id,
+                         const uint8_t *cert_pem, size_t cert_len,
+                         const uint8_t *key_pem, size_t key_len,
+                         const uint8_t *ca_pem, size_t ca_len);
+/* Same, from PEM files (POSIX builds only: src/pqiot_posix.c). */
 int pqiot_identity_load(pqiot_identity *id, const char *cert_file,
-                        const char *key_file);
+                        const char *key_file, const char *ca_file);
 void pqiot_identity_free(pqiot_identity *id);
 
 /* Transcript: call once per handshake message, sent or received, in wire
@@ -150,13 +163,25 @@ int pqiot_auth_sign(pqiot_identity *id, wc_Sha256 *th, const char *role,
                     uint8_t *sig, size_t *siglen);
 
 /* Authenticate a peer from its CERT and VERIFY bodies. Succeeds only if the
- * certificate chains to `ca_file`, carries an ML-DSA-65 key, has CN
- * `want_cn` (unless NULL), and `sig` verifies over the transcript as
+ * certificate chains to our CA (`self->ca`), carries an ML-DSA-65 key, has
+ * CN `want_cn` (unless NULL), and `sig` verifies over the transcript as
  * `role`. The peer's CN goes to `cn` for logging. */
-int pqiot_auth_verify(const char *ca_file, const uint8_t *cert,
+int pqiot_auth_verify(const pqiot_identity *self, const uint8_t *cert,
                       size_t cert_len, const char *want_cn, wc_Sha256 *th,
                       const char *role, const uint8_t *sig, size_t siglen,
                       char *cn, size_t cncap);
+
+/* One whole PQIOT/2 session on a connected transport, handshake through the
+ * DATA exchange (src/session.c). 0 on success. */
+int pqiot_server_session(int fd, pqiot_identity *id);
+int pqiot_device_session(int fd, const char *msg, pqiot_identity *id);
+
+/* Platform hooks behind the framed I/O: POSIX read/write on a socket in
+ * src/pqiot_posix.c, in-memory pipes on bare metal. Same contract as
+ * read(2)/write(2): bytes moved (possibly fewer), 0 = peer closed (read),
+ * negative = error. */
+long pqiot_sys_read(int fd, void *buf, size_t len);
+long pqiot_sys_write(int fd, const void *buf, size_t len);
 
 /* Human-readable name for a message type, for logging. */
 const char *pqiot_msg_name(uint8_t type);
