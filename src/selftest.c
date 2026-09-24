@@ -1,10 +1,13 @@
-/* Self-check for the PQIOT primitives. Fails loudly if any of the crypto or
- * the frame parser regresses. Run with `make check`. */
+/* Self-check for the PQIOT primitives. Fails loudly if any of the crypto,
+ * the authentication or the frame parser regresses. Run with `make check`,
+ * which also builds the demo PKI and the certificates it must refuse. */
 #include "pqiot.h"
 
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
+
+#include <wolfssl/wolfcrypt/asn_public.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -142,6 +145,117 @@ static void test_framing(void)
     printf("ok  framing (roundtrip, bounds, bad magic rejected)\n");
 }
 
+/* A PEM certificate file as DER, as it would arrive in a CERT message. */
+static size_t cert_der(const char *path, uint8_t *der, size_t cap)
+{
+    uint8_t pem[16384];
+    FILE *f = fopen(path, "rb");
+    size_t n;
+    int len;
+
+    assert(f != NULL);
+    n = fread(pem, 1, sizeof(pem), f);
+    fclose(f);
+    len = wc_CertPemToDer(pem, (int)n, der, (int)cap, CERT_TYPE);
+    assert(len > 0);
+    return (size_t)len;
+}
+
+/* Run one handshake transcript through sign/verify, then show that every
+ * way of getting it wrong is refused. */
+static void test_auth(void)
+{
+    static const uint8_t kem_pub[] = "stand-in for PUBKEY";
+    static const uint8_t kem_ct[]  = "stand-in for KEMCT";
+    pqiot_identity server, device, rogue;
+    wc_Sha256 th, other;
+    uint8_t sig[PQIOT_SIG_SZ], dsig[PQIOT_SIG_SZ], ecdsa[PQIOT_MAX_BODY];
+    size_t siglen, dsiglen, ecdsa_len;
+    char cn[256];
+
+    assert(pqiot_identity_load(&server, PKI_SERVER_CERT_FILE, PKI_SERVER_KEY_FILE) == 0);
+    assert(pqiot_identity_load(&device, PKI_DEVICE_CERT_FILE, PKI_DEVICE_KEY_FILE) == 0);
+    assert(pqiot_identity_load(&rogue, "build/certs/bad/rogue.pem",
+                               "build/certs/bad/rogue.key") == 0);
+    /* An ECDSA key is not an identity we can even load. */
+    assert(pqiot_identity_load(&(pqiot_identity){0}, "build/certs/bad/ecdsa-srv.pem",
+                               "build/certs/bad/ecdsa-srv.key") != 0);
+
+    assert(wc_InitSha256(&th) == 0);
+    assert(pqiot_transcript_add(&th, PQIOT_MSG_PUBKEY, kem_pub, sizeof(kem_pub)) == 0);
+    assert(pqiot_transcript_add(&th, PQIOT_MSG_KEMCT, kem_ct, sizeof(kem_ct)) == 0);
+    assert(pqiot_transcript_add(&th, PQIOT_MSG_CERT, server.cert, server.cert_len) == 0);
+    assert(pqiot_auth_sign(&server, &th, PQIOT_ROLE_SERVER, sig, &siglen) == 0);
+    assert(siglen == PQIOT_SIG_SZ);
+
+    /* The genuine server, as the device sees it. */
+    assert(pqiot_auth_verify(PKI_CA_FILE, server.cert, server.cert_len,
+                             PKI_SERVER_NAME, &th, PQIOT_ROLE_SERVER,
+                             sig, siglen, cn, sizeof(cn)) == 0);
+    assert(strcmp(cn, PKI_SERVER_NAME) == 0);
+
+    /* A different transcript -- e.g. a man in the middle swapped the KEM
+     * cipher text -- must not verify. */
+    assert(wc_InitSha256(&other) == 0);
+    assert(pqiot_transcript_add(&other, PQIOT_MSG_PUBKEY, kem_pub, sizeof(kem_pub)) == 0);
+    assert(pqiot_transcript_add(&other, PQIOT_MSG_KEMCT, kem_pub, sizeof(kem_pub)) == 0);
+    assert(pqiot_transcript_add(&other, PQIOT_MSG_CERT, server.cert, server.cert_len) == 0);
+    assert(pqiot_auth_verify(PKI_CA_FILE, server.cert, server.cert_len,
+                             PKI_SERVER_NAME, &other, PQIOT_ROLE_SERVER,
+                             sig, siglen, cn, sizeof(cn)) != 0);
+
+    /* The server's signature replayed as if it were a device's. */
+    assert(pqiot_auth_verify(PKI_CA_FILE, server.cert, server.cert_len, NULL,
+                             &th, PQIOT_ROLE_DEVICE, sig, siglen,
+                             cn, sizeof(cn)) != 0);
+
+    /* One flipped bit in the signature. */
+    sig[100] ^= 0x01;
+    assert(pqiot_auth_verify(PKI_CA_FILE, server.cert, server.cert_len,
+                             PKI_SERVER_NAME, &th, PQIOT_ROLE_SERVER,
+                             sig, siglen, cn, sizeof(cn)) != 0);
+    sig[100] ^= 0x01;
+
+    /* A genuine device posing as the server: valid CA, valid signature,
+     * wrong name. */
+    assert(pqiot_auth_sign(&device, &th, PQIOT_ROLE_SERVER, dsig, &dsiglen) == 0);
+    assert(pqiot_auth_verify(PKI_CA_FILE, device.cert, device.cert_len,
+                             PKI_SERVER_NAME, &th, PQIOT_ROLE_SERVER,
+                             dsig, dsiglen, cn, sizeof(cn)) != 0);
+
+    /* The genuine device, as the server sees it (any CN from the CA). */
+    assert(pqiot_auth_sign(&device, &th, PQIOT_ROLE_DEVICE, dsig, &dsiglen) == 0);
+    assert(pqiot_auth_verify(PKI_CA_FILE, device.cert, device.cert_len, NULL,
+                             &th, PQIOT_ROLE_DEVICE, dsig, dsiglen,
+                             cn, sizeof(cn)) == 0);
+    assert(strcmp(cn, "device-0001.pqiot.test") == 0);
+
+    /* Right name, valid signature, but the certificate is from another CA. */
+    assert(pqiot_auth_sign(&rogue, &th, PQIOT_ROLE_SERVER, sig, &siglen) == 0);
+    assert(pqiot_auth_verify(PKI_CA_FILE, rogue.cert, rogue.cert_len,
+                             PKI_SERVER_NAME, &th, PQIOT_ROLE_SERVER,
+                             sig, siglen, cn, sizeof(cn)) != 0);
+
+    /* Our own CA, right name, but a classical (ECDSA) key. */
+    ecdsa_len = cert_der("build/certs/bad/ecdsa-srv.pem", ecdsa, sizeof(ecdsa));
+    assert(pqiot_auth_sign(&server, &th, PQIOT_ROLE_SERVER, sig, &siglen) == 0);
+    assert(pqiot_auth_verify(PKI_CA_FILE, ecdsa, ecdsa_len, PKI_SERVER_NAME,
+                             &th, PQIOT_ROLE_SERVER, sig, siglen,
+                             cn, sizeof(cn)) != 0);
+
+    /* Truncated certificate. */
+    assert(pqiot_auth_verify(PKI_CA_FILE, server.cert, server.cert_len / 2,
+                             PKI_SERVER_NAME, &th, PQIOT_ROLE_SERVER,
+                             sig, siglen, cn, sizeof(cn)) != 0);
+
+    wc_Sha256Free(&th);
+    wc_Sha256Free(&other);
+    pqiot_identity_free(&server);
+    pqiot_identity_free(&device);
+    pqiot_identity_free(&rogue);
+    printf("ok  auth (ML-DSA-65: transcript, role, name, CA, key type, tampering)\n");
+}
+
 int main(void)
 {
     assert(pqiot_rng() != NULL);
@@ -151,6 +265,7 @@ int main(void)
     test_aead_roundtrip();
     test_aead_rejects_tampering();
     test_framing();
+    test_auth();
 
     printf("\nall self-checks passed\n");
     return 0;

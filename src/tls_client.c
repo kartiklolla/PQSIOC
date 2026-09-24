@@ -1,5 +1,6 @@
 /* PQTLS client -- the IoT device, over TLS 1.3 or DTLS 1.3 with the
- * X25519MLKEM768 hybrid group. Verifies the server against the demo CA.
+ * X25519MLKEM768 hybrid group. Presents its own ML-DSA-65 certificate and
+ * verifies the server's against the demo CA.
  *
  *   ./pqtls-client [--dtls] [host] [port] [message]
  */
@@ -14,7 +15,6 @@
 
 int main(int argc, char **argv)
 {
-    static const int groups[] = { PQTLS_GROUP };
     struct sockaddr_in addr;
     WOLFSSL_CTX *ctx = NULL;
     WOLFSSL *ssl = NULL;
@@ -40,19 +40,11 @@ int main(int argc, char **argv)
     }
 
     wolfSSL_Init();
-    ctx = wolfSSL_CTX_new(dtls ? wolfDTLSv1_3_client_method()
-                               : wolfTLSv1_3_client_method());
-    if (ctx == NULL ||
-        wolfSSL_CTX_load_verify_locations(ctx, PQTLS_CA_FILE, NULL) != WOLFSSL_SUCCESS) {
-        fprintf(stderr, "client: context/CA setup failed "
-                        "(run `make certs` from the repo root)\n");
+    ctx = pqtls_ctx_new(dtls ? wolfDTLSv1_3_client_method()
+                             : wolfTLSv1_3_client_method(),
+                        PKI_DEVICE_CERT_FILE, PKI_DEVICE_KEY_FILE, "client");
+    if (ctx == NULL)
         goto out;
-    }
-    wolfSSL_CTX_set_verify(ctx, WOLFSSL_VERIFY_PEER, NULL);
-    if (wolfSSL_CTX_set_groups(ctx, (int *)groups, 1) != WOLFSSL_SUCCESS) {
-        fprintf(stderr, "client: X25519MLKEM768 not available in this wolfSSL\n");
-        goto out;
-    }
 
     /* connect() on UDP just fixes the peer; nothing goes on the wire. */
     fd = socket(AF_INET, dtls ? SOCK_DGRAM : SOCK_STREAM, 0);
@@ -69,7 +61,7 @@ int main(int argc, char **argv)
         /* Send the hybrid key share in the first flight, so the handshake
          * needs no HelloRetryRequest round trip. */
         wolfSSL_UseKeyShare(ssl, PQTLS_GROUP) != WOLFSSL_SUCCESS ||
-        wolfSSL_check_domain_name(ssl, PQTLS_SERVER_NAME) != WOLFSSL_SUCCESS) {
+        wolfSSL_check_domain_name(ssl, PKI_SERVER_NAME) != WOLFSSL_SUCCESS) {
         fprintf(stderr, "client: session setup failed\n");
         goto out;
     }
@@ -80,6 +72,8 @@ int main(int argc, char **argv)
         goto out;
     }
     pqtls_report(ssl, "device");
+    if (pqtls_check_peer(ssl, "device") != 0)
+        goto out;
 
     ret = wolfSSL_write(ssl, msg, (int)strlen(msg));
     if (ret != (int)strlen(msg)) {

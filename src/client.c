@@ -1,5 +1,7 @@
 /* PQIOT client -- stands in for the constrained IoT device. Encapsulates
- * against the server's ML-KEM public key, then sends encrypted telemetry.
+ * against the server's ML-KEM public key, checks the server's ML-DSA-65
+ * signature and name, proves its own identity the same way, then sends
+ * encrypted telemetry.
  *
  *   ./pqiot-client [host] [port] [message]
  */
@@ -35,9 +37,53 @@ static int connect_to(const char *host, uint16_t port)
     return fd;
 }
 
-static int run(int fd, const char *msg)
+/* Steps 3-4: the server proves it is PKI_SERVER_NAME. Then 5-6: we prove
+ * who we are, over the same transcript. 0 on success. */
+static int authenticate(int fd, pqiot_identity *id, wc_Sha256 *th)
+{
+    uint8_t cert[PQIOT_MAX_BODY], sig[PQIOT_SIG_SZ];
+    size_t cert_len, siglen;
+    char cn[256];
+    uint8_t type;
+
+    if (pqiot_recv(fd, &type, cert, sizeof(cert), &cert_len) != 0 ||
+        type != PQIOT_MSG_CERT ||
+        pqiot_transcript_add(th, type, cert, cert_len) != 0) {
+        fprintf(stderr, "client: expected server CERT\n");
+        return -1;
+    }
+    if (pqiot_recv(fd, &type, sig, sizeof(sig), &siglen) != 0 ||
+        type != PQIOT_MSG_VERIFY) {
+        fprintf(stderr, "client: expected server VERIFY\n");
+        return -1;
+    }
+    if (pqiot_auth_verify(PKI_CA_FILE, cert, cert_len, PKI_SERVER_NAME, th,
+                          PQIOT_ROLE_SERVER, sig, siglen,
+                          cn, sizeof(cn)) != 0) {
+        fprintf(stderr, "client: server authentication failed%s%s\n",
+                cn[0] ? " for CN=" : "", cn);
+        return -1;
+    }
+    printf("[device] <- CERT, VERIFY: server authenticated: CN=%s (ML-DSA-65)\n",
+           cn);
+
+    if (pqiot_transcript_add(th, PQIOT_MSG_VERIFY, sig, siglen) != 0 ||
+        pqiot_send(fd, PQIOT_MSG_CERT, id->cert, id->cert_len) != 0 ||
+        pqiot_transcript_add(th, PQIOT_MSG_CERT, id->cert, id->cert_len) != 0 ||
+        pqiot_auth_sign(id, th, PQIOT_ROLE_DEVICE, sig, &siglen) != 0 ||
+        pqiot_send(fd, PQIOT_MSG_VERIFY, sig, siglen) != 0) {
+        fprintf(stderr, "client: sending our CERT/VERIFY failed\n");
+        return -1;
+    }
+    printf("[device] -> CERT     %zu bytes, VERIFY %zu bytes (ML-DSA-65)\n",
+           id->cert_len, siglen);
+    return 0;
+}
+
+static int run(int fd, const char *msg, pqiot_identity *id)
 {
     MlKemKey kem;
+    wc_Sha256 th;
     uint8_t pub[PQIOT_MAX_BODY];
     uint8_t ct[PQIOT_KEMCT_SZ];
     uint8_t ss[PQIOT_SS_SZ];
@@ -48,6 +94,9 @@ static int run(int fd, const char *msg)
     uint8_t type;
     int rc = -1;
 
+    if (wc_InitSha256(&th) != 0)
+        return -1;
+
     if (wc_MlKemKey_Init(&kem, PQIOT_MLKEM_LEVEL, NULL, INVALID_DEVID) != 0) {
         fprintf(stderr, "client: ML-KEM init failed\n");
         return -1;
@@ -55,7 +104,8 @@ static int run(int fd, const char *msg)
 
     /* 1. Take the server's public key off the wire. */
     if (pqiot_recv(fd, &type, pub, sizeof(pub), &len) != 0 ||
-        type != PQIOT_MSG_PUBKEY) {
+        type != PQIOT_MSG_PUBKEY ||
+        pqiot_transcript_add(&th, type, pub, len) != 0) {
         fprintf(stderr, "client: expected PUBKEY\n");
         goto out;
     }
@@ -72,7 +122,8 @@ static int run(int fd, const char *msg)
         fprintf(stderr, "client: encapsulation failed\n");
         goto out;
     }
-    if (pqiot_send(fd, PQIOT_MSG_KEMCT, ct, sizeof(ct)) != 0) {
+    if (pqiot_send(fd, PQIOT_MSG_KEMCT, ct, sizeof(ct)) != 0 ||
+        pqiot_transcript_add(&th, PQIOT_MSG_KEMCT, ct, sizeof(ct)) != 0) {
         fprintf(stderr, "client: send KEMCT failed\n");
         goto out;
     }
@@ -85,7 +136,11 @@ static int run(int fd, const char *msg)
     }
     printf("[device] shared secret established, AES-256 keys derived\n");
 
-    /* 3. Encrypt the payload under the KEM-derived key and ship it. */
+    /* No telemetry leaves before the server has proven who it is. */
+    if (authenticate(fd, id, &th) != 0)
+        goto out;
+
+    /* 7. Encrypt the payload under the KEM-derived key and ship it. */
     if (pqiot_seal(keys.c2s, (const uint8_t *)msg, strlen(msg),
                    frame, sizeof(frame), &sealed) != 0) {
         fprintf(stderr, "client: encryption failed\n");
@@ -98,7 +153,7 @@ static int run(int fd, const char *msg)
     printf("[device] -> DATA     %zu bytes, plaintext was \"%s\"\n",
            sealed, msg);
 
-    /* 4. Read the server's encrypted acknowledgement. */
+    /* 8. Read the server's encrypted acknowledgement. */
     if (pqiot_recv(fd, &type, frame, sizeof(frame), &len) != 0 ||
         type != PQIOT_MSG_DATA) {
         fprintf(stderr, "client: expected DATA reply\n");
@@ -114,6 +169,7 @@ static int run(int fd, const char *msg)
     rc = 0;
 out:
     wc_MlKemKey_Free(&kem);
+    wc_Sha256Free(&th);
     return rc;
 }
 
@@ -122,6 +178,7 @@ int main(int argc, char **argv)
     const char *host = (argc > 1) ? argv[1] : "127.0.0.1";
     uint16_t    port = (argc > 2) ? (uint16_t)atoi(argv[2]) : PQIOT_DEFAULT_PORT;
     const char *msg  = (argc > 3) ? argv[3] : "sensor=temp value=23.4C";
+    pqiot_identity id;
     int fd, rc;
 
     if (pqiot_rng() == NULL) {
@@ -129,15 +186,24 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    if (pqiot_identity_load(&id, PKI_DEVICE_CERT_FILE, PKI_DEVICE_KEY_FILE) != 0) {
+        fprintf(stderr, "client: cannot load %s / %s "
+                        "(run `make certs` from the repo root)\n",
+                PKI_DEVICE_CERT_FILE, PKI_DEVICE_KEY_FILE);
+        return 1;
+    }
+
     fd = connect_to(host, port);
     if (fd < 0) {
         perror("client: connect");
+        pqiot_identity_free(&id);
         return 1;
     }
     printf("[device] connected to %s:%u\n", host, port);
 
-    rc = run(fd, msg);
+    rc = run(fd, msg, &id);
     close(fd);
+    pqiot_identity_free(&id);
 
     printf("[device] %s\n", rc == 0 ? "session OK" : "session FAILED");
     return rc == 0 ? 0 : 1;

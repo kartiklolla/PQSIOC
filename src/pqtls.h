@@ -7,9 +7,11 @@
  * fallback to downgrade to. (Pure ML-KEM as a TLS group is compiled out of
  * wolfSSL by default -- WOLFSSL_TLS_NO_MLKEM_STANDALONE.)
  *
- * Server authentication is an ECDSA P-256 certificate from a demo CA
- * (`make certs`). That part is still classical; ML-DSA certificates are a
- * separate stretch goal.
+ * Authentication is mutual and ML-DSA-65 on both sides: the server and each
+ * device hold an ML-DSA-65 certificate from the demo CA (`make certs`), each
+ * side demands the other's, and each refuses a peer whose certificate key
+ * is anything but ML-DSA-65 -- so the CertificateVerify signatures that
+ * prove possession of those keys are post-quantum too.
  */
 #ifndef PQTLS_H
 #define PQTLS_H
@@ -18,21 +20,67 @@
 
 #include <wolfssl/options.h>
 #include <wolfssl/ssl.h>
+#include <wolfssl/wolfcrypt/asn_public.h>
 
-#if !defined(WOLFSSL_TLS13) || !defined(WOLFSSL_HAVE_MLKEM)
-#error "wolfSSL needs TLS 1.3 and ML-KEM (build/<arch> from `make tls`)"
+#include "pki.h"
+
+#if !defined(WOLFSSL_TLS13) || !defined(WOLFSSL_HAVE_MLKEM) || \
+    !defined(WOLFSSL_HAVE_MLDSA) || !defined(KEEP_PEER_CERT)
+#error "wolfSSL needs TLS 1.3, ML-KEM, ML-DSA and KEEP_PEER_CERT (build/<arch> from `make tls`)"
 #endif
 
 #define PQTLS_GROUP       WOLFSSL_X25519MLKEM768
-/* CN/SAN of the demo certificate. wolfSSL only checks FQDNs, and .test is
- * reserved (RFC 2606), so this can never be a real host. */
-#define PQTLS_SERVER_NAME "server.pqiot.test"
+#define PQTLS_PEER_KEY    ML_DSA_65k /* the only certificate key we accept */
 #define PQTLS_DEFAULT_PORT 4433
 
-/* Relative to the repo root, where the Makefile runs everything. */
-#define PQTLS_CA_FILE   "build/certs/ca.pem"
-#define PQTLS_CERT_FILE "build/certs/server.pem"
-#define PQTLS_KEY_FILE  "build/certs/server.key"
+/* Context shared by both ends: our own certificate and key, the demo CA to
+ * verify the peer against, a peer certificate required either way, and the
+ * hybrid group only. NULL (after saying why) on failure. */
+static WOLFSSL_CTX *pqtls_ctx_new(WOLFSSL_METHOD *method, const char *cert,
+                                  const char *key, const char *who)
+{
+    static const int groups[] = { PQTLS_GROUP };
+    WOLFSSL_CTX *ctx = wolfSSL_CTX_new(method);
+
+    if (ctx == NULL ||
+        wolfSSL_CTX_load_verify_locations(ctx, PKI_CA_FILE, NULL) != WOLFSSL_SUCCESS ||
+        wolfSSL_CTX_use_certificate_chain_file(ctx, cert) != WOLFSSL_SUCCESS ||
+        wolfSSL_CTX_use_PrivateKey_file(ctx, key, WOLFSSL_FILETYPE_PEM) != WOLFSSL_SUCCESS) {
+        fprintf(stderr, "%s: certificate setup failed "
+                        "(run `make certs` from the repo root)\n", who);
+        wolfSSL_CTX_free(ctx);
+        return NULL;
+    }
+    wolfSSL_CTX_set_verify(ctx, WOLFSSL_VERIFY_PEER |
+                                WOLFSSL_VERIFY_FAIL_IF_NO_PEER_CERT, NULL);
+    if (wolfSSL_CTX_set_groups(ctx, (int *)groups, 1) != WOLFSSL_SUCCESS) {
+        fprintf(stderr, "%s: X25519MLKEM768 not available in this wolfSSL\n", who);
+        wolfSSL_CTX_free(ctx);
+        return NULL;
+    }
+    return ctx;
+}
+
+/* wolfSSL has already verified the peer's chain up to the demo CA and its
+ * CertificateVerify signature. This additionally pins the key type: the
+ * build still has ECC (see WOLF_CONF in the Makefile), so an ECDSA leaf
+ * under the same CA would otherwise pass with a classical signature.
+ * 0 if the peer is ML-DSA-65. */
+static int pqtls_check_peer(WOLFSSL *ssl, const char *who)
+{
+    WOLFSSL_X509 *peer = wolfSSL_get_peer_certificate(ssl);
+    int ok = peer != NULL &&
+             wolfSSL_X509_get_pubkey_type(peer) == PQTLS_PEER_KEY;
+
+    if (ok)
+        printf("[%s] peer authenticated: CN=%s (ML-DSA-65)\n", who,
+               wolfSSL_X509_get_subjectCN(peer));
+    else
+        fprintf(stderr, "%s: peer certificate is not ML-DSA-65, refusing\n",
+                who);
+    wolfSSL_X509_free(peer);
+    return ok ? 0 : -1;
+}
 
 /* Lets the negotiated group be read back by name after the handshake. */
 static inline void pqtls_report(WOLFSSL *ssl, const char *who)

@@ -1,8 +1,8 @@
 # PQIOT -- post-quantum secure IoT communication
 #
 #   make          build client, server and the self-check
-#   make check    run the crypto/framing self-check
-#   make demo     run a full loopback session
+#   make check    run the crypto/framing/authentication self-check
+#   make demo     run a full loopback session (mutual ML-DSA-65 auth)
 #   make capture  same, under tshark, writing demo.pcap
 #
 #   make riscv        cross-build all three for riscv64 (static)
@@ -14,14 +14,27 @@
 #
 #   make tls          TLS/DTLS 1.3 endpoints (X25519MLKEM768), + demo certs
 #   make tls-demo     one TLS session, then one DTLS session
-#   make tls-check    interop with OpenSSL, and refuse a classical-only server
+#   make tls-check    interop with OpenSSL, plus refusal cases
+#   make certs        the demo PKI (also built on demand by the above)
 #   make tls-capture  tls-demo under tshark, writing demo-tls.pcap
 
 CC      ?= cc
 # -D_GNU_SOURCE: memmem() in the self-check.
 # No -DNDEBUG anywhere: the self-check is built out of assert().
 CFLAGS  ?= -std=c11 -O2 -g -Wall -Wextra -D_GNU_SOURCE
-LDLIBS  := -lwolfssl
+
+# Everything links a static wolfSSL built from source (see below): the
+# system library has neither ML-DSA nor DTLS.
+HOST_LIB := build/host/lib/libwolfssl.a
+RV_LIB   := build/riscv/lib/libwolfssl.a
+LDLIBS   := $(HOST_LIB) -lm
+
+# Demo PKI (`make certs`, recipes below). Prerequisites expand as make reads
+# them, so these must be defined before the first rule that names them.
+CERTS     := build/certs/ca.pem build/certs/server.pem build/certs/server.key \
+             build/certs/device.pem build/certs/device.key
+BAD_CERTS := build/certs/bad/rogue.pem build/certs/bad/ecdsa-srv.pem \
+             build/certs/bad/ecdsa-dev.pem
 
 PORT ?= 4433
 MSG  ?= sensor=temp value=23.4C
@@ -40,52 +53,65 @@ pqiot-client: src/client.o src/pqiot.o
 pqiot-selftest: src/selftest.o src/pqiot.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-src/%.o: src/%.c src/pqiot.h
-	$(CC) $(CFLAGS) -c -o $@ $<
+src/%.o: src/%.c src/pqiot.h src/pki.h
+	$(CC) $(CFLAGS) -Ibuild/host/include -c -o $@ $<
 
-check: pqiot-selftest
+# Not in the pattern above: there, a prerequisite that another pattern rule
+# must build first makes make fall back to its built-in %.o: %.c rule, which
+# compiles against the system headers instead.
+$(OBJS): $(HOST_LIB)
+
+check: pqiot-selftest $(CERTS) $(BAD_CERTS)
 	./pqiot-selftest
 
 # Server runs in the background; its exit status is folded into ours so a
 # failed session fails the target.
-demo: pqiot-server pqiot-client
+demo: pqiot-server pqiot-client $(CERTS)
 	@./pqiot-server $(PORT) & srv=$$!; \
 	 sleep 0.5; \
 	 ./pqiot-client 127.0.0.1 $(PORT) "$(MSG)"; rc=$$?; \
 	 wait $$srv || rc=1; \
 	 exit $$rc
 
-capture: pqiot-server pqiot-client
+capture: pqiot-server pqiot-client $(CERTS)
 	@tools/capture.sh $(PORT) "$(MSG)"
 
 # --- wolfSSL from source ------------------------------------------------
-# The system wolfSSL has no DTLS and no riscv64 build, so the TLS endpoints
-# and everything RISC-V link a static wolfSSL built here instead: one
-# out-of-tree build per architecture from a single checkout, pinned to the
-# same release as the host library. The plain PQIOT binaries keep using the
-# system library.
+# The system wolfSSL has no ML-DSA, no DTLS and no riscv64 build, so
+# everything links a static wolfSSL built here instead: one out-of-tree
+# build per architecture from a single checkout, pinned to v5.9.2.
 WOLFSSL_TAG ?= v5.9.2-stable
 WOLF_SRC    := build/wolfssl-src
 WOLF_CONF   := --enable-static --disable-shared \
                --enable-tls13 --enable-dtls --enable-dtls13 \
                --enable-dtls-frag-ch \
-               --enable-mlkem --enable-curve25519 --enable-hkdf --enable-aesgcm \
-               --disable-examples --disable-crypttests
+               --enable-mlkem --enable-mldsa \
+               --disable-rsa --disable-dh \
+               --enable-curve25519 --enable-hkdf --enable-aesgcm \
+               --disable-examples --disable-crypttests \
+               CPPFLAGS=-DKEEP_PEER_CERT
 # --enable-dtls-frag-ch: a ClientHello carrying a 1216-byte X25519MLKEM768
 # key share can exceed one datagram; without this the DTLS 1.3 server
 # rejects the fragmented hello.
+# --enable-mldsa, --disable-rsa/dh: authentication is ML-DSA only. ECC
+# can't be disabled too (v5.9.2 fails to compile without it), so the
+# endpoints check the peer's key type after the handshake instead -- which
+# needs KEEP_PEER_CERT for wolfSSL_get_peer_certificate().
 
 $(WOLF_SRC):
 	git clone -q --depth 1 --branch $(WOLFSSL_TAG) \
 	    https://github.com/wolfSSL/wolfssl.git $@
 	cd $@ && ./autogen.sh
 
-HOST_LIB := build/host/lib/libwolfssl.a
-RV_LIB   := build/riscv/lib/libwolfssl.a
-
 $(HOST_LIB): WOLF_CROSS :=
 $(RV_LIB):   WOLF_CROSS  = --host=$(RV_HOST) CC=$(RV_CC)
-build/%/lib/libwolfssl.a: | $(WOLF_SRC)
+# Named after a hash of WOLF_CONF, so changing the flags rebuilds wolfSSL in
+# an existing build/ instead of silently linking the old feature set.
+WOLF_STAMP := build/wolfssl-$(shell echo '$(WOLF_CONF)' | md5sum | cut -c1-8).stamp
+$(WOLF_STAMP):
+	@mkdir -p build && rm -f build/wolfssl-*.stamp && touch $@
+
+build/%/lib/libwolfssl.a: $(WOLF_STAMP) | $(WOLF_SRC)
 	mkdir -p build/obj-$*
 	cd build/obj-$* && ../wolfssl-src/configure $(WOLF_CROSS) \
 	    --prefix=$(CURDIR)/build/$* $(WOLF_CONF) && \
@@ -94,29 +120,50 @@ build/%/lib/libwolfssl.a: | $(WOLF_SRC)
 # --- TLS / DTLS 1.3 ------------------------------------------------------
 TLS_BINS := pqtls-server pqtls-client
 TLS_OBJS := build/tls/tls_server.o build/tls/tls_client.o
-CERTS    := build/certs/ca.pem build/certs/server.pem build/certs/server.key
 
-build/tls/%.o: src/%.c src/pqtls.h $(HOST_LIB)
+build/tls/%.o: src/%.c src/pqtls.h src/pki.h $(HOST_LIB)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -Ibuild/host/include -c -o $@ $<
 
 $(TLS_BINS): pqtls-%: build/tls/tls_%.o
 	$(CC) $(CFLAGS) -o $@ $^ $(HOST_LIB) -lm
 
-# Demo PKI: a throwaway ECDSA P-256 CA and a server certificate for
-# PQTLS_SERVER_NAME. Never reuse these keys for anything real.
+# Demo PKI, all ML-DSA-65: a throwaway CA, a server certificate for
+# PKI_SERVER_NAME and one device certificate. Never reuse these keys.
+# $(1): name, $(2): CN, $(3): extensions for the CSR, $(4): -newkey
+# arguments (default ML-DSA-65).
+issue = openssl req -newkey $(or $(4),ML-DSA-65) -nodes -subj /CN=$(2) $(3) \
+	    -keyout $(1).key -out $(1).csr && \
+	openssl x509 -req -in $(1).csr -CA ca.pem -CAkey ca.key \
+	    -CAcreateserial -copy_extensions copy -days 825 -out $(1).pem
+
 $(CERTS) &:
 	@mkdir -p build/certs
 	cd build/certs && \
-	openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
-	    -days 3650 -subj /CN=PQIOT-demo-CA -keyout ca.key -out ca.pem && \
-	openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
-	    -subj /CN=server.pqiot.test -addext subjectAltName=DNS:server.pqiot.test \
-	    -keyout server.key -out server.csr && \
-	openssl x509 -req -in server.csr -CA ca.pem -CAkey ca.key \
-	    -CAcreateserial -copy_extensions copy -days 825 -out server.pem
+	openssl req -x509 -newkey ML-DSA-65 -nodes -days 3650 \
+	    -subj /CN=PQIOT-demo-CA -keyout ca.key -out ca.pem && \
+	$(call issue,server,server.pqiot.test,\
+	    -addext subjectAltName=DNS:server.pqiot.test \
+	    -addext extendedKeyUsage=serverAuth) && \
+	$(call issue,device,device-0001.pqiot.test,\
+	    -addext extendedKeyUsage=clientAuth)
 
-certs: $(CERTS)
+# Certificates the endpoints must refuse, for `make check` and tls-check:
+# the server's name from a rogue CA, and ECDSA keys from our own CA.
+EC_P256   := EC -pkeyopt ec_paramgen_curve:P-256
+
+$(BAD_CERTS) &: $(CERTS)
+	@mkdir -p build/certs/bad
+	cd build/certs && \
+	openssl req -x509 -newkey ML-DSA-65 -nodes -days 825 \
+	    -subj /CN=server.pqiot.test \
+	    -addext subjectAltName=DNS:server.pqiot.test \
+	    -keyout bad/rogue.key -out bad/rogue.pem && \
+	$(call issue,bad/ecdsa-srv,server.pqiot.test,\
+	    -addext subjectAltName=DNS:server.pqiot.test,$(EC_P256)) && \
+	$(call issue,bad/ecdsa-dev,device-0001.pqiot.test,,$(EC_P256))
+
+certs: $(CERTS) $(BAD_CERTS)
 
 tls: $(TLS_BINS) $(CERTS)
 
@@ -134,7 +181,7 @@ tls-demo: tls
 	 echo; echo "== DTLS 1.3 over UDP"; \
 	 $(call tls_session,pqtls-server --dtls,./pqtls-client --dtls)
 
-tls-check: tls
+tls-check: tls $(BAD_CERTS)
 	@tools/tls-check.sh $(PORT) "$(MSG)"
 
 tls-capture: tls
@@ -154,7 +201,7 @@ RV_BINS := $(PQ_RV_BINS) $(TLS_RV_BINS)
 RV_OBJS := $(patsubst src/%.o,build/rv64/%.o,$(OBJS)) \
            build/rv64/tls_server.o build/rv64/tls_client.o
 
-build/rv64/%.o: src/%.c src/pqiot.h src/pqtls.h $(RV_LIB)
+build/rv64/%.o: src/%.c src/pqiot.h src/pqtls.h src/pki.h $(RV_LIB)
 	@mkdir -p $(@D)
 	$(RV_CC) $(RV_CFLAGS) -c -o $@ $<
 
@@ -166,19 +213,19 @@ $(TLS_RV_BINS): pqtls-%.rv64: build/rv64/tls_%.o
 
 riscv: $(RV_BINS)
 
-riscv-check: pqiot-selftest.rv64
+riscv-check: pqiot-selftest.rv64 $(CERTS) $(BAD_CERTS)
 	$(QEMU) ./pqiot-selftest.rv64
 
 # The native server and an emulated RISC-V device: proves the cross-built
 # endpoint interoperates, not just that it runs.
-riscv-demo: pqiot-server pqiot-client.rv64
+riscv-demo: pqiot-server pqiot-client.rv64 $(CERTS)
 	@./pqiot-server $(PORT) & srv=$$!; \
 	 sleep 0.5; \
 	 $(QEMU) ./pqiot-client.rv64 127.0.0.1 $(PORT) "$(MSG)"; rc=$$?; \
 	 wait $$srv || rc=1; \
 	 exit $$rc
 
-riscv-capture: pqiot-server pqiot-client.rv64
+riscv-capture: pqiot-server pqiot-client.rv64 $(CERTS)
 	@CLIENT="$(QEMU) ./pqiot-client.rv64" OUT=demo-riscv.pcap \
 	 tools/capture.sh $(PORT) "$(MSG)"
 

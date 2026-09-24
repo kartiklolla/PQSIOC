@@ -1,4 +1,5 @@
-/* PQIOT/1 -- post-quantum secure channel for constrained devices.
+/* PQIOT/2 -- post-quantum secure channel for constrained devices, with
+ * mutual ML-DSA-65 authentication.
  *
  * Wire format, every message:
  *
@@ -8,9 +9,20 @@
  *   +------+-----+-----+---------+------------------+
  *
  * Handshake:
- *   server -> client  PUBKEY  ML-KEM-768 public key      (1184 B)
- *   client -> server  KEMCT   ML-KEM-768 cipher text     (1088 B)
+ *   server -> device  PUBKEY  ML-KEM-768 public key            (1184 B)
+ *   device -> server  KEMCT   ML-KEM-768 cipher text           (1088 B)
+ *   server -> device  CERT    server's ML-DSA-65 certificate   (DER)
+ *   server -> device  VERIFY  ML-DSA-65 signature over the transcript
+ *   device -> server  CERT    device's ML-DSA-65 certificate   (DER)
+ *   device -> server  VERIFY  ML-DSA-65 signature over the transcript
  *   either direction  DATA    [12B IV][16B tag][ct]
+ *
+ * The transcript is SHA-256 over every handshake message (header and body)
+ * sent or received so far, so each signature covers the ML-KEM public key,
+ * the cipher text, and everything the peer has said. Swapping any of them --
+ * a man in the middle substituting his own KEM key, say -- breaks the
+ * signature. Signatures carry a per-role ML-DSA context string, so a
+ * server's signature can never be replayed as a device's or vice versa.
  *
  * The KEM shared secret is never used as an AES key directly; it is expanded
  * by HKDF-SHA256 into one key per direction so the two sides can never reuse
@@ -25,6 +37,10 @@
 #include <wolfssl/options.h>
 #include <wolfssl/wolfcrypt/random.h>
 #include <wolfssl/wolfcrypt/wc_mlkem.h>
+#include <wolfssl/wolfcrypt/wc_mldsa.h>
+#include <wolfssl/wolfcrypt/sha256.h>
+
+#include "pki.h"
 
 /* NIST level 3. Both peers must agree; that is what this constant is for. */
 #define PQIOT_MLKEM_LEVEL WC_ML_KEM_768
@@ -35,7 +51,7 @@
 #define PQIOT_MAGIC1 'Q'
 #define PQIOT_MAGIC2 'I'
 #define PQIOT_MAGIC3 'O'
-#define PQIOT_VER    1
+#define PQIOT_VER    2 /* 1 had no authentication */
 
 #define PQIOT_HDR_SZ 8
 
@@ -43,10 +59,18 @@
 #define PQIOT_MSG_PUBKEY 0x01
 #define PQIOT_MSG_KEMCT  0x02
 #define PQIOT_MSG_DATA   0x03
+#define PQIOT_MSG_CERT   0x04
+#define PQIOT_MSG_VERIFY 0x05
 
-/* Big enough for an ML-KEM-768 public key (1184 B), the largest thing we
+/* Big enough for an ML-DSA-65 certificate (~5.5 KB), the largest thing we
  * ever put on the wire. Bounds every read from the socket. */
-#define PQIOT_MAX_BODY 2048
+#define PQIOT_MAX_BODY 8192
+
+#define PQIOT_SIG_SZ  WC_MLDSA_65_SIG_SIZE /* 3309 */
+
+/* ML-DSA context strings: which role produced a signature. */
+#define PQIOT_ROLE_SERVER "PQIOT/2 server"
+#define PQIOT_ROLE_DEVICE "PQIOT/2 device"
 
 #define PQIOT_SS_SZ  32 /* ML-KEM shared secret */
 #define PQIOT_KEY_SZ 32 /* AES-256 */
@@ -84,6 +108,38 @@ int pqiot_open(const uint8_t key[PQIOT_KEY_SZ], const uint8_t *in, size_t inlen,
 /* Framed socket I/O. Both handle short reads/writes. */
 int pqiot_send(int fd, uint8_t type, const uint8_t *body, size_t len);
 int pqiot_recv(int fd, uint8_t *type, uint8_t *body, size_t cap, size_t *len);
+
+/* Our side of the authentication: a certificate from the demo CA and its
+ * ML-DSA-65 signing key. */
+typedef struct {
+    uint8_t     cert[PQIOT_MAX_BODY]; /* DER, sent as-is in CERT */
+    size_t      cert_len;
+    wc_MlDsaKey key;
+} pqiot_identity;
+
+/* Load a PEM certificate and its PEM private key. */
+int pqiot_identity_load(pqiot_identity *id, const char *cert_file,
+                        const char *key_file);
+void pqiot_identity_free(pqiot_identity *id);
+
+/* Transcript: call once per handshake message, sent or received, in wire
+ * order. th must be wc_InitSha256()'d first. */
+int pqiot_transcript_add(wc_Sha256 *th, uint8_t type, const uint8_t *body,
+                         size_t len);
+
+/* Sign the transcript so far as `role` (PQIOT_ROLE_*). `sig` needs
+ * PQIOT_SIG_SZ bytes. */
+int pqiot_auth_sign(pqiot_identity *id, wc_Sha256 *th, const char *role,
+                    uint8_t *sig, size_t *siglen);
+
+/* Authenticate a peer from its CERT and VERIFY bodies. Succeeds only if the
+ * certificate chains to `ca_file`, carries an ML-DSA-65 key, has CN
+ * `want_cn` (unless NULL), and `sig` verifies over the transcript as
+ * `role`. The peer's CN goes to `cn` for logging. */
+int pqiot_auth_verify(const char *ca_file, const uint8_t *cert,
+                      size_t cert_len, const char *want_cn, wc_Sha256 *th,
+                      const char *role, const uint8_t *sig, size_t siglen,
+                      char *cn, size_t cncap);
 
 /* Human-readable name for a message type, for logging. */
 const char *pqiot_msg_name(uint8_t type);

@@ -1,5 +1,6 @@
-/* PQTLS server: TLS 1.3 or DTLS 1.3 with the X25519MLKEM768 hybrid group.
- * Serves one device session, then exits.
+/* PQTLS server: TLS 1.3 or DTLS 1.3 with the X25519MLKEM768 hybrid group,
+ * mutually authenticated with ML-DSA-65. Serves one device session, then
+ * exits. Any device holding a certificate from the demo CA is accepted.
  *
  *   ./pqtls-server [--dtls] [port]
  */
@@ -57,7 +58,6 @@ fail:
 
 int main(int argc, char **argv)
 {
-    static const int groups[] = { PQTLS_GROUP };
     static const char reply[] = "ack: telemetry received";
     struct sockaddr_in peer;
     WOLFSSL_CTX *ctx = NULL;
@@ -74,22 +74,14 @@ int main(int argc, char **argv)
         port = (uint16_t)atoi(argv[1]);
 
     wolfSSL_Init();
-    ctx = wolfSSL_CTX_new(dtls ? wolfDTLSv1_3_server_method()
-                               : wolfTLSv1_3_server_method());
-    if (ctx == NULL ||
-        wolfSSL_CTX_use_certificate_chain_file(ctx, PQTLS_CERT_FILE) != WOLFSSL_SUCCESS ||
-        wolfSSL_CTX_use_PrivateKey_file(ctx, PQTLS_KEY_FILE,
-                                        WOLFSSL_FILETYPE_PEM) != WOLFSSL_SUCCESS) {
-        fprintf(stderr, "server: context/certificate setup failed "
-                        "(run `make certs` from the repo root)\n");
+    /* Hybrid group only: a client offering classical-only key exchange gets
+     * a handshake failure, not a downgrade. A client with no certificate
+     * gets one too. */
+    ctx = pqtls_ctx_new(dtls ? wolfDTLSv1_3_server_method()
+                             : wolfTLSv1_3_server_method(),
+                        PKI_SERVER_CERT_FILE, PKI_SERVER_KEY_FILE, "server");
+    if (ctx == NULL)
         goto out;
-    }
-    /* Only the hybrid group: a client offering classical-only key exchange
-     * gets a handshake failure, not a downgrade. */
-    if (wolfSSL_CTX_set_groups(ctx, (int *)groups, 1) != WOLFSSL_SUCCESS) {
-        fprintf(stderr, "server: X25519MLKEM768 not available in this wolfSSL\n");
-        goto out;
-    }
 
     fd = accept_one(port, dtls, &peer);
     if (fd < 0) {
@@ -112,6 +104,8 @@ int main(int argc, char **argv)
         goto out;
     }
     pqtls_report(ssl, "server");
+    if (pqtls_check_peer(ssl, "server") != 0)
+        goto out;
 
     ret = wolfSSL_read(ssl, buf, sizeof(buf) - 1);
     if (ret <= 0) {

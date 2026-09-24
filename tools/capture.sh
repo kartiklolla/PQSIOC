@@ -1,6 +1,7 @@
 #!/bin/sh
 # Capture a PQIOT session on loopback and prove from the packets alone that
-# the ML-KEM exchange really happened and the payload really was encrypted.
+# the ML-KEM exchange and the ML-DSA authentication really happened and the
+# payload really was encrypted.
 #
 #   tools/capture.sh [port] [message]
 #
@@ -63,13 +64,16 @@ wait $CAP 2>/dev/null || true
 trap - EXIT
 
 echo
-echo "== PQIOT frames on the wire (magic 'PQIO' = 50:51:49:4f)"
+# TCP coalesces back-to-back messages (CERT+VERIFY, say) into one segment,
+# so this lists segments that *start* with a PQIOT header.
+echo "== TCP segments starting with a PQIOT header (magic 'PQIO' = 50:51:49:4f)"
 tshark -r "$OUT" -Y 'tcp.payload contains 50:51:49:4f' \
        -T fields -e frame.number -e tcp.srcport -e tcp.dstport -e tcp.len \
        -E header=y -E separator=' '
 
 echo
-echo "== the 1184-byte ML-KEM-768 public key and 1088-byte cipher text"
+echo "== handshake bodies: ML-KEM-768 public key (1184) and cipher text (1088),"
+echo "   then each side's ML-DSA-65 CERT + VERIFY (~5.5 KB + 3309, one segment)"
 tshark -r "$OUT" -Y 'tcp.len > 900' \
        -T fields -e frame.number -e tcp.srcport -e tcp.len \
        -E header=y -E separator=' '
