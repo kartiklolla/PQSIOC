@@ -59,7 +59,9 @@ make check
 Asserts that encapsulation and decapsulation agree on the same secret, that
 HKDF separates the two directions, that AES-GCM round-trips, and that a
 tampered tag, a flipped cipher-text bit, a wrong key, a truncated frame, an
-oversized frame and a bad magic are all rejected.
+oversized frame and a bad magic are all rejected. It also checks that all
+four derived keys differ, and that a sealed frame hides its body and only
+opens under the right key as the right type.
 
 For authentication, it signs a handshake transcript and checks that the
 genuine server and device verify. It then checks that each of these is
@@ -82,8 +84,9 @@ make capture
 
 Captures loopback with tshark into `demo.pcap`, then shows the PQIOT
 messages, including the 1184- and 1088-byte ML-KEM packets and each side's
-certificate and signature, and asserts the plaintext appears in **no**
-captured packet.
+sealed certificate and signature. It asserts that **no** captured packet
+contains the plaintext or either certificate's name. Without the sealing,
+both names show up in the capture, so this check really does fail.
 
 Loopback capture needs privileges — add yourself to the `wireshark` group
 once and log back in:
@@ -137,11 +140,14 @@ frames are easy to pick out of a capture:
 |------|-----------|------|------|
 | 1 | server → device | `PUBKEY` (0x01) | ML-KEM-768 public key, 1184 B |
 | 2 | device → server | `KEMCT` (0x02) | ML-KEM cipher text, 1088 B |
-| 3 | server → device | `CERT` (0x04) | server's ML-DSA-65 certificate, DER |
-| 4 | server → device | `VERIFY` (0x05) | ML-DSA-65 signature over the transcript, 3309 B |
-| 5 | device → server | `CERT` (0x04) | device's ML-DSA-65 certificate, DER |
-| 6 | device → server | `VERIFY` (0x05) | ML-DSA-65 signature over the transcript, 3309 B |
+| 3 | server → device | `CERT` (0x04) | sealed: server's ML-DSA-65 certificate, DER |
+| 4 | server → device | `VERIFY` (0x05) | sealed: ML-DSA-65 signature over the transcript, 3309 B |
+| 5 | device → server | `CERT` (0x04) | sealed: device's ML-DSA-65 certificate, DER |
+| 6 | device → server | `VERIFY` (0x05) | sealed: ML-DSA-65 signature over the transcript, 3309 B |
 | 7+ | either way | `DATA` (0x03) | `[12B IV][16B tag][cipher text]` |
+
+*Sealed* bodies have the same `[12B IV][16B tag][cipher text]` layout as
+`DATA`, under the handshake keys.
 
 The device encapsulates against the server's public key: that produces the
 cipher text for step 2 and, locally, a 32-byte shared secret. The server
@@ -149,8 +155,10 @@ decapsulates the cipher text and arrives at the identical secret — with no
 key material derived from any quantum-vulnerable primitive.
 
 That secret is **not** used as an AES key directly. HKDF-SHA256 expands it
-into one key per direction (`"PQIOT/2 c2s"` and `"PQIOT/2 s2c"`), so the two
-sides can never collide on a (key, IV) pair. Each `DATA` message gets a fresh
+into four keys: one per direction for the handshake (`"PQIOT/2 hs c2s"`,
+`"PQIOT/2 hs s2c"`) and one per direction for `DATA` (`"PQIOT/2 c2s"`,
+`"PQIOT/2 s2c"`). So the two sides can never collide on a (key, IV) pair,
+and a sealed `CERT` or `VERIFY` can never pass as `DATA`. Each `DATA` message gets a fresh
 random 96-bit IV, since GCM breaks catastrophically if one is reused.
 
 ### Authentication
@@ -176,9 +184,14 @@ was PQIOT/1. Each side now proves who it is, the way TLS 1.3 does:
 - **Ordering.** The device sends no telemetry until the server is
   authenticated, and the server reads no telemetry until the device is.
 
-Certificates travel in the clear, unlike TLS 1.3, so a passive observer can
-see which device is talking. `CERT` and `VERIFY` could be sent encrypted
-under the derived keys if that matters.
+**Identity privacy.** `CERT` and `VERIFY` are sealed under the handshake
+keys, as in TLS 1.3, so a passive observer can't tell which device is
+talking or to which server. The device sends its certificate only after the
+server has authenticated, so even an active attacker who runs the KEM with
+the device never sees the device's identity. The server's certificate goes
+to whoever runs the KEM with it, which is fine: the server's identity is
+public. The transcript hashes the plaintext messages, so encryption doesn't
+change what the signatures cover.
 
 The version byte is now 2. A PQIOT/1 peer gets its frames rejected rather
 than silently skipping authentication.
@@ -285,3 +298,20 @@ tools/tls-capture.sh   TLS/DTLS capture: key share groups on the wire
 - [x] TLS/DTLS 1.3 integration (X25519MLKEM768 hybrid key exchange)
 - [x] ML-DSA mutual authentication (ML-DSA-65 certificates, PQIOT/2 and
       TLS/DTLS 1.3)
+- [x] Encrypted PQIOT/2 handshake (sealed `CERT`/`VERIFY`: device identity
+      hidden from passive and active attackers)
+
+### Known limits
+
+- **Demo PKI only.** Keys sit unencrypted in `build/certs`, and there's no
+  revocation (CRL/OCSP) or enrolment of new devices.
+- **Servers are single-session.** Each binary serves one device, then
+  exits.
+- **PQIOT/2 checks only the certificate's CN.** It doesn't read the SAN;
+  our certificates put the same name in both.
+- **ECC is still compiled into wolfSSL.** v5.9.2 won't build without it.
+  Each endpoint instead refuses any peer key that isn't ML-DSA-65.
+- **DTLS 1.3 isn't tested against another implementation.** OpenSSL has no
+  DTLS 1.3, so `tls-check` covers TLS only.
+- **No end-to-end man-in-the-middle test.** `make check` tests transcript
+  binding at the function level, not with an attacker in the path.
