@@ -7,23 +7,25 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <wolfssl/wolfcrypt/memory.h>
+
 /* ---- server ------------------------------------------------------------ */
 
 /* Steps 3-4: prove we are the server. Then 5-6: make the device prove who
  * it is, over the same transcript. All four travel sealed under the
  * handshake keys; the transcript hashes their plaintext. 0 on success. */
 static int server_authenticate(int fd, pqiot_identity *id, wc_Sha256 *th,
-                               const pqiot_keys *keys)
+                               pqiot_keys *keys)
 {
     uint8_t cert[PQIOT_MAX_BODY], sig[PQIOT_SIG_SZ];
     size_t cert_len, siglen;
     char cn[256];
 
-    if (pqiot_send_sealed(fd, keys->hs_s2c, PQIOT_MSG_CERT,
+    if (pqiot_send_sealed(fd, &keys->tx, PQIOT_MSG_CERT,
                           id->cert, id->cert_len) != 0 ||
         pqiot_transcript_add(th, PQIOT_MSG_CERT, id->cert, id->cert_len) != 0 ||
         pqiot_auth_sign(id, th, PQIOT_ROLE_SERVER, sig, &siglen) != 0 ||
-        pqiot_send_sealed(fd, keys->hs_s2c, PQIOT_MSG_VERIFY, sig, siglen) != 0 ||
+        pqiot_send_sealed(fd, &keys->tx, PQIOT_MSG_VERIFY, sig, siglen) != 0 ||
         pqiot_transcript_add(th, PQIOT_MSG_VERIFY, sig, siglen) != 0) {
         fprintf(stderr, "server: sending our CERT/VERIFY failed\n");
         return -1;
@@ -31,13 +33,13 @@ static int server_authenticate(int fd, pqiot_identity *id, wc_Sha256 *th,
     printf("[server] -> CERT     %zu bytes, VERIFY %zu bytes (ML-DSA-65, sealed)\n",
            id->cert_len, siglen);
 
-    if (pqiot_recv_sealed(fd, keys->hs_c2s, PQIOT_MSG_CERT,
+    if (pqiot_recv_sealed(fd, &keys->rx, PQIOT_MSG_CERT,
                           cert, sizeof(cert), &cert_len) != 0 ||
         pqiot_transcript_add(th, PQIOT_MSG_CERT, cert, cert_len) != 0) {
         fprintf(stderr, "server: expected sealed device CERT\n");
         return -1;
     }
-    if (pqiot_recv_sealed(fd, keys->hs_c2s, PQIOT_MSG_VERIFY,
+    if (pqiot_recv_sealed(fd, &keys->rx, PQIOT_MSG_VERIFY,
                           sig, sizeof(sig), &siglen) != 0) {
         fprintf(stderr, "server: expected sealed device VERIFY\n");
         return -1;
@@ -65,6 +67,7 @@ int pqiot_server_session(int fd, pqiot_identity *id)
     uint8_t frame[PQIOT_MAX_BODY];
     uint8_t pt[PQIOT_MAX_BODY];
     pqiot_keys keys;
+    int keyed = 0;
     size_t len, ptlen;
     uint8_t type;
     int rc = -1;
@@ -107,15 +110,20 @@ int pqiot_server_session(int fd, pqiot_identity *id)
         fprintf(stderr, "server: decapsulation failed\n");
         goto out;
     }
-    if (pqiot_derive_keys(ss, sizeof(ss), &keys) != 0) {
+    if (pqiot_derive_keys(ss, sizeof(ss), 1, &keys) != 0) {
         fprintf(stderr, "server: key derivation failed\n");
         goto out;
     }
+    keyed = 1;
     printf("[server] shared secret established, AES-256 keys derived\n");
 
     /* No DATA is read before the device has proven who it is. */
     if (server_authenticate(fd, id, &th, &keys) != 0)
         goto out;
+    if (pqiot_keys_phase(&keys, PQIOT_PHASE_DATA) != 0) {
+        fprintf(stderr, "server: data keys failed\n");
+        goto out;
+    }
 
     /* 7. Decrypt the device's payload under the KEM-derived key. */
     if (pqiot_recv(fd, &type, frame, sizeof(frame), &len) != 0 ||
@@ -123,7 +131,7 @@ int pqiot_server_session(int fd, pqiot_identity *id)
         fprintf(stderr, "server: expected DATA\n");
         goto out;
     }
-    if (pqiot_open(keys.c2s, frame, len, pt, sizeof(pt) - 1, &ptlen) != 0) {
+    if (pqiot_open(&keys.rx, frame, len, pt, sizeof(pt) - 1, &ptlen) != 0) {
         fprintf(stderr, "server: decryption/auth failed\n");
         goto out;
     }
@@ -135,7 +143,7 @@ int pqiot_server_session(int fd, pqiot_identity *id)
         static const char reply[] = "ack: telemetry received";
         size_t sealed;
 
-        if (pqiot_seal(keys.s2c, (const uint8_t *)reply, sizeof(reply) - 1,
+        if (pqiot_seal(&keys.tx, (const uint8_t *)reply, sizeof(reply) - 1,
                        frame, sizeof(frame), &sealed) != 0 ||
             pqiot_send(fd, PQIOT_MSG_DATA, frame, sealed) != 0) {
             fprintf(stderr, "server: reply failed\n");
@@ -146,6 +154,9 @@ int pqiot_server_session(int fd, pqiot_identity *id)
 
     rc = 0;
 out:
+    if (keyed)
+        pqiot_keys_free(&keys);
+    wc_ForceZero(ss, sizeof(ss));
     wc_MlKemKey_Free(&kem);
     wc_Sha256Free(&th);
     return rc;
@@ -159,19 +170,19 @@ out:
  * only after the server checks out, so our identity never reaches anyone
  * else. 0 on success. */
 static int device_authenticate(int fd, pqiot_identity *id, wc_Sha256 *th,
-                               const pqiot_keys *keys)
+                               pqiot_keys *keys)
 {
     uint8_t cert[PQIOT_MAX_BODY], sig[PQIOT_SIG_SZ];
     size_t cert_len, siglen;
     char cn[256];
 
-    if (pqiot_recv_sealed(fd, keys->hs_s2c, PQIOT_MSG_CERT,
+    if (pqiot_recv_sealed(fd, &keys->rx, PQIOT_MSG_CERT,
                           cert, sizeof(cert), &cert_len) != 0 ||
         pqiot_transcript_add(th, PQIOT_MSG_CERT, cert, cert_len) != 0) {
         fprintf(stderr, "client: expected sealed server CERT\n");
         return -1;
     }
-    if (pqiot_recv_sealed(fd, keys->hs_s2c, PQIOT_MSG_VERIFY,
+    if (pqiot_recv_sealed(fd, &keys->rx, PQIOT_MSG_VERIFY,
                           sig, sizeof(sig), &siglen) != 0) {
         fprintf(stderr, "client: expected sealed server VERIFY\n");
         return -1;
@@ -187,11 +198,11 @@ static int device_authenticate(int fd, pqiot_identity *id, wc_Sha256 *th,
            cn);
 
     if (pqiot_transcript_add(th, PQIOT_MSG_VERIFY, sig, siglen) != 0 ||
-        pqiot_send_sealed(fd, keys->hs_c2s, PQIOT_MSG_CERT,
+        pqiot_send_sealed(fd, &keys->tx, PQIOT_MSG_CERT,
                           id->cert, id->cert_len) != 0 ||
         pqiot_transcript_add(th, PQIOT_MSG_CERT, id->cert, id->cert_len) != 0 ||
         pqiot_auth_sign(id, th, PQIOT_ROLE_DEVICE, sig, &siglen) != 0 ||
-        pqiot_send_sealed(fd, keys->hs_c2s, PQIOT_MSG_VERIFY, sig, siglen) != 0) {
+        pqiot_send_sealed(fd, &keys->tx, PQIOT_MSG_VERIFY, sig, siglen) != 0) {
         fprintf(stderr, "client: sending our CERT/VERIFY failed\n");
         return -1;
     }
@@ -211,6 +222,7 @@ int pqiot_device_session(int fd, const char *msg, pqiot_identity *id)
     uint8_t frame[PQIOT_MAX_BODY];
     uint8_t pt[PQIOT_MAX_BODY];
     pqiot_keys keys;
+    int keyed = 0;
     size_t len, sealed, ptlen;
     uint8_t type;
     int rc = -1;
@@ -251,18 +263,23 @@ int pqiot_device_session(int fd, const char *msg, pqiot_identity *id)
     printf("[device] -> KEMCT    %zu bytes (ML-KEM cipher text)\n",
            sizeof(ct));
 
-    if (pqiot_derive_keys(ss, sizeof(ss), &keys) != 0) {
+    if (pqiot_derive_keys(ss, sizeof(ss), 0, &keys) != 0) {
         fprintf(stderr, "client: key derivation failed\n");
         goto out;
     }
+    keyed = 1;
     printf("[device] shared secret established, AES-256 keys derived\n");
 
     /* No telemetry leaves before the server has proven who it is. */
     if (device_authenticate(fd, id, &th, &keys) != 0)
         goto out;
+    if (pqiot_keys_phase(&keys, PQIOT_PHASE_DATA) != 0) {
+        fprintf(stderr, "client: data keys failed\n");
+        goto out;
+    }
 
     /* 7. Encrypt the payload under the KEM-derived key and ship it. */
-    if (pqiot_seal(keys.c2s, (const uint8_t *)msg, strlen(msg),
+    if (pqiot_seal(&keys.tx, (const uint8_t *)msg, strlen(msg),
                    frame, sizeof(frame), &sealed) != 0) {
         fprintf(stderr, "client: encryption failed\n");
         goto out;
@@ -280,7 +297,7 @@ int pqiot_device_session(int fd, const char *msg, pqiot_identity *id)
         fprintf(stderr, "client: expected DATA reply\n");
         goto out;
     }
-    if (pqiot_open(keys.s2c, frame, len, pt, sizeof(pt) - 1, &ptlen) != 0) {
+    if (pqiot_open(&keys.rx, frame, len, pt, sizeof(pt) - 1, &ptlen) != 0) {
         fprintf(stderr, "client: decryption/auth failed\n");
         goto out;
     }
@@ -289,6 +306,9 @@ int pqiot_device_session(int fd, const char *msg, pqiot_identity *id)
 
     rc = 0;
 out:
+    if (keyed)
+        pqiot_keys_free(&keys);
+    wc_ForceZero(ss, sizeof(ss));
     wc_MlKemKey_Free(&kem);
     wc_Sha256Free(&th);
     return rc;

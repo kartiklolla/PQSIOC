@@ -48,6 +48,7 @@
 #include <wolfssl/options.h>
 #endif
 #include <wolfssl/wolfcrypt/settings.h>
+#include <wolfssl/wolfcrypt/aes.h>
 #include <wolfssl/wolfcrypt/random.h>
 #include <wolfssl/wolfcrypt/wc_mlkem.h>
 #include <wolfssl/wolfcrypt/wc_mldsa.h>
@@ -101,34 +102,53 @@ typedef struct {
     uint8_t hs_s2c[PQIOT_KEY_SZ]; /* CERT/VERIFY, server -> client */
     uint8_t c2s[PQIOT_KEY_SZ];    /* DATA, client -> server */
     uint8_t s2c[PQIOT_KEY_SZ];    /* DATA, server -> client */
+    /* One sending and one receiving AES-GCM context for the current phase,
+     * keyed once per phase rather than per message: on the bare-metal core
+     * key setup costs more than sealing a small message. Two, not four,
+     * because each bitsliced context is ~31 KB of RAM. */
+    Aes tx, rx;
+    int server; /* which side we are: picks tx/rx from the four keys */
 } pqiot_keys;
+
+enum { PQIOT_PHASE_HANDSHAKE, PQIOT_PHASE_DATA };
 
 /* All functions return 0 on success and a negative value on failure. */
 
 /* Process-wide CSPRNG, seeded on first use. NULL if seeding failed. */
 WC_RNG *pqiot_rng(void);
 
-/* Expand the 32-byte KEM shared secret into the four keys above. */
-int pqiot_derive_keys(const uint8_t *ss, size_t ss_len, pqiot_keys *out);
+/* Expand the 32-byte KEM shared secret into the four keys above, and key
+ * tx/rx for the handshake phase as the server (server=1) or the device.
+ * On success, release with pqiot_keys_free. */
+int pqiot_derive_keys(const uint8_t *ss, size_t ss_len, int server,
+                      pqiot_keys *out);
+/* Re-key tx/rx for `phase` (PQIOT_PHASE_*). */
+int pqiot_keys_phase(pqiot_keys *k, int phase);
+/* Free the contexts and wipe every key. */
+void pqiot_keys_free(pqiot_keys *k);
 
-/* AES-256-GCM. `out` needs ptlen + PQIOT_AEAD_OVERHEAD bytes; the IV is
- * generated fresh from the CSPRNG for every call. */
-int pqiot_seal(const uint8_t key[PQIOT_KEY_SZ], const uint8_t *pt, size_t ptlen,
+/* Key one AES-256-GCM context (what pqiot_keys_phase does for tx/rx).
+ * Release with wc_AesFree. */
+int pqiot_aead_init(Aes *aes, const uint8_t key[PQIOT_KEY_SZ]);
+
+/* AES-256-GCM under a keyed context. `out` needs ptlen +
+ * PQIOT_AEAD_OVERHEAD bytes; the IV is fresh from the CSPRNG every call. */
+int pqiot_seal(Aes *aes, const uint8_t *pt, size_t ptlen,
                uint8_t *out, size_t outcap, size_t *outlen);
 
 /* Inverse of pqiot_seal. Fails if the tag does not verify. */
-int pqiot_open(const uint8_t key[PQIOT_KEY_SZ], const uint8_t *in, size_t inlen,
+int pqiot_open(Aes *aes, const uint8_t *in, size_t inlen,
                uint8_t *pt, size_t ptcap, size_t *ptlen);
 
 /* Framed socket I/O. Both handle short reads/writes. */
 int pqiot_send(int fd, uint8_t type, const uint8_t *body, size_t len);
 int pqiot_recv(int fd, uint8_t *type, uint8_t *body, size_t cap, size_t *len);
 
-/* Framed I/O with the body sealed/opened under `key` (pqiot_seal/open).
+/* Framed I/O with the body sealed/opened under `aes` (pqiot_seal/open).
  * recv fails unless the frame is of type `want` and authenticates. */
-int pqiot_send_sealed(int fd, const uint8_t key[PQIOT_KEY_SZ], uint8_t type,
+int pqiot_send_sealed(int fd, Aes *aes, uint8_t type,
                       const uint8_t *pt, size_t ptlen);
-int pqiot_recv_sealed(int fd, const uint8_t key[PQIOT_KEY_SZ], uint8_t want,
+int pqiot_recv_sealed(int fd, Aes *aes, uint8_t want,
                       uint8_t *pt, size_t ptcap, size_t *ptlen);
 
 /* Our side of the authentication: a certificate from the demo CA, its

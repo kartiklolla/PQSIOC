@@ -41,7 +41,8 @@ WC_RNG *pqiot_rng(void)
     return &rng;
 }
 
-int pqiot_derive_keys(const uint8_t *ss, size_t ss_len, pqiot_keys *out)
+int pqiot_derive_keys(const uint8_t *ss, size_t ss_len, int server,
+                      pqiot_keys *out)
 {
     /* Distinct info strings => independent keys from one secret. No salt: the
      * KEM secret is already uniformly random, which is what a salt buys. */
@@ -56,26 +57,71 @@ int pqiot_derive_keys(const uint8_t *ss, size_t ss_len, pqiot_keys *out)
     if (ss == NULL || out == NULL || ss_len != PQIOT_SS_SZ)
         return PQIOT_ERR;
 
+    out->server = server;
+    if (wc_AesInit(&out->tx, NULL, INVALID_DEVID) != 0)
+        return PQIOT_ERR;
+    if (wc_AesInit(&out->rx, NULL, INVALID_DEVID) != 0) {
+        wc_AesFree(&out->tx);
+        return PQIOT_ERR;
+    }
     for (i = 0; i < sizeof(k) / sizeof(k[0]); i++)
         if (wc_HKDF(WC_SHA256, ss, (word32)ss_len, NULL, 0,
                     (const byte *)k[i].info, (word32)strlen(k[i].info),
-                    k[i].key, PQIOT_KEY_SZ) != 0)
+                    k[i].key, PQIOT_KEY_SZ) != 0) {
+            pqiot_keys_free(out);
             return PQIOT_ERR;
-
+        }
+    if (pqiot_keys_phase(out, PQIOT_PHASE_HANDSHAKE) != 0) {
+        pqiot_keys_free(out);
+        return PQIOT_ERR;
+    }
     return 0;
 }
 
-int pqiot_seal(const uint8_t key[PQIOT_KEY_SZ], const uint8_t *pt, size_t ptlen,
+int pqiot_keys_phase(pqiot_keys *k, int phase)
+{
+    const uint8_t *c2s, *s2c;
+
+    if (k == NULL)
+        return PQIOT_ERR;
+    c2s = phase == PQIOT_PHASE_HANDSHAKE ? k->hs_c2s : k->c2s;
+    s2c = phase == PQIOT_PHASE_HANDSHAKE ? k->hs_s2c : k->s2c;
+    if (wc_AesGcmSetKey(&k->tx, k->server ? s2c : c2s, PQIOT_KEY_SZ) != 0 ||
+        wc_AesGcmSetKey(&k->rx, k->server ? c2s : s2c, PQIOT_KEY_SZ) != 0)
+        return PQIOT_ERR;
+    return 0;
+}
+
+void pqiot_keys_free(pqiot_keys *k)
+{
+    if (k == NULL)
+        return;
+    wc_AesFree(&k->tx);
+    wc_AesFree(&k->rx);
+    wc_ForceZero(k, sizeof(*k)); /* raw keys and expanded round keys */
+}
+
+int pqiot_aead_init(Aes *aes, const uint8_t key[PQIOT_KEY_SZ])
+{
+    if (aes == NULL || key == NULL || wc_AesInit(aes, NULL, INVALID_DEVID) != 0)
+        return PQIOT_ERR;
+    if (wc_AesGcmSetKey(aes, key, PQIOT_KEY_SZ) != 0) {
+        wc_AesFree(aes);
+        return PQIOT_ERR;
+    }
+    return 0;
+}
+
+int pqiot_seal(Aes *aes, const uint8_t *pt, size_t ptlen,
                uint8_t *out, size_t outcap, size_t *outlen)
 {
-    Aes aes;
     WC_RNG *rng;
     uint8_t *iv  = out;                   /* [0 ..12) */
     uint8_t *tag = out + PQIOT_IV_SZ;     /* [12..28) */
     uint8_t *ct  = out + PQIOT_AEAD_OVERHEAD;
     int rc;
 
-    if (key == NULL || out == NULL || outlen == NULL || (pt == NULL && ptlen))
+    if (aes == NULL || out == NULL || outlen == NULL || (pt == NULL && ptlen))
         return PQIOT_ERR;
     if (outcap < ptlen + PQIOT_AEAD_OVERHEAD)
         return PQIOT_ERR;
@@ -88,15 +134,8 @@ int pqiot_seal(const uint8_t key[PQIOT_KEY_SZ], const uint8_t *pt, size_t ptlen,
     if (wc_RNG_GenerateBlock(rng, iv, PQIOT_IV_SZ) != 0)
         return PQIOT_ERR;
 
-    if (wc_AesInit(&aes, NULL, INVALID_DEVID) != 0)
-        return PQIOT_ERR;
-
-    rc = wc_AesGcmSetKey(&aes, key, PQIOT_KEY_SZ);
-    if (rc == 0)
-        rc = wc_AesGcmEncrypt(&aes, ct, pt, (word32)ptlen,
-                              iv, PQIOT_IV_SZ, tag, PQIOT_TAG_SZ, NULL, 0);
-    wc_AesFree(&aes);
-
+    rc = wc_AesGcmEncrypt(aes, ct, pt, (word32)ptlen,
+                          iv, PQIOT_IV_SZ, tag, PQIOT_TAG_SZ, NULL, 0);
     if (rc != 0)
         return PQIOT_ERR;
 
@@ -104,17 +143,16 @@ int pqiot_seal(const uint8_t key[PQIOT_KEY_SZ], const uint8_t *pt, size_t ptlen,
     return 0;
 }
 
-int pqiot_open(const uint8_t key[PQIOT_KEY_SZ], const uint8_t *in, size_t inlen,
+int pqiot_open(Aes *aes, const uint8_t *in, size_t inlen,
                uint8_t *pt, size_t ptcap, size_t *ptlen)
 {
-    Aes aes;
     const uint8_t *iv  = in;
     const uint8_t *tag = in + PQIOT_IV_SZ;
     const uint8_t *ct  = in + PQIOT_AEAD_OVERHEAD;
     size_t ctlen;
     int rc;
 
-    if (key == NULL || in == NULL || pt == NULL || ptlen == NULL)
+    if (aes == NULL || in == NULL || pt == NULL || ptlen == NULL)
         return PQIOT_ERR;
     /* Attacker-controlled length: a short frame must not underflow ctlen. */
     if (inlen < PQIOT_AEAD_OVERHEAD)
@@ -124,14 +162,8 @@ int pqiot_open(const uint8_t key[PQIOT_KEY_SZ], const uint8_t *in, size_t inlen,
     if (ctlen > ptcap)
         return PQIOT_ERR;
 
-    if (wc_AesInit(&aes, NULL, INVALID_DEVID) != 0)
-        return PQIOT_ERR;
-
-    rc = wc_AesGcmSetKey(&aes, key, PQIOT_KEY_SZ);
-    if (rc == 0)
-        rc = wc_AesGcmDecrypt(&aes, pt, ct, (word32)ctlen,
-                              iv, PQIOT_IV_SZ, tag, PQIOT_TAG_SZ, NULL, 0);
-    wc_AesFree(&aes);
+    rc = wc_AesGcmDecrypt(aes, pt, ct, (word32)ctlen,
+                          iv, PQIOT_IV_SZ, tag, PQIOT_TAG_SZ, NULL, 0);
 
     /* wc_AesGcmDecrypt returns AES_GCM_AUTH_E on a bad tag. */
     if (rc != 0)
@@ -220,18 +252,18 @@ int pqiot_recv(int fd, uint8_t *type, uint8_t *body, size_t cap, size_t *len)
     return 0;
 }
 
-int pqiot_send_sealed(int fd, const uint8_t key[PQIOT_KEY_SZ], uint8_t type,
+int pqiot_send_sealed(int fd, Aes *aes, uint8_t type,
                       const uint8_t *pt, size_t ptlen)
 {
     uint8_t frame[PQIOT_MAX_BODY];
     size_t len;
 
-    if (pqiot_seal(key, pt, ptlen, frame, sizeof(frame), &len) != 0)
+    if (pqiot_seal(aes, pt, ptlen, frame, sizeof(frame), &len) != 0)
         return PQIOT_ERR;
     return pqiot_send(fd, type, frame, len);
 }
 
-int pqiot_recv_sealed(int fd, const uint8_t key[PQIOT_KEY_SZ], uint8_t want,
+int pqiot_recv_sealed(int fd, Aes *aes, uint8_t want,
                       uint8_t *pt, size_t ptcap, size_t *ptlen)
 {
     uint8_t frame[PQIOT_MAX_BODY];
@@ -241,7 +273,7 @@ int pqiot_recv_sealed(int fd, const uint8_t key[PQIOT_KEY_SZ], uint8_t want,
     if (pqiot_recv(fd, &type, frame, sizeof(frame), &len) != 0 ||
         type != want)
         return PQIOT_ERR;
-    return pqiot_open(key, frame, len, pt, ptcap, ptlen);
+    return pqiot_open(aes, frame, len, pt, ptcap, ptlen);
 }
 
 const char *pqiot_msg_name(uint8_t type)

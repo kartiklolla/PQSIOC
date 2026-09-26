@@ -37,7 +37,24 @@ static void test_kem_agreement(void)
            sizeof(pub), sizeof(ct));
 }
 
-/* Same secret in => same keys out, and all four keys must differ. */
+/* Does a message sealed under `aes` open under a context keyed from `key`? */
+static int seals_under(Aes *aes, const uint8_t key[PQIOT_KEY_SZ])
+{
+    uint8_t sealed[64], out[64];
+    size_t slen, olen;
+    Aes raw;
+    int ok;
+
+    assert(pqiot_seal(aes, (const uint8_t *)"x", 1, sealed, sizeof(sealed),
+                      &slen) == 0);
+    assert(pqiot_aead_init(&raw, key) == 0);
+    ok = pqiot_open(&raw, sealed, slen, out, sizeof(out), &olen) == 0;
+    wc_AesFree(&raw);
+    return ok;
+}
+
+/* Same secret in => same keys out, all four keys differ, and each side's
+ * tx/rx use the right ones. */
 static void test_key_derivation(void)
 {
     uint8_t ss[PQIOT_SS_SZ];
@@ -46,17 +63,33 @@ static void test_key_derivation(void)
     int i, j;
 
     memset(ss, 0xA5, sizeof(ss));
-    assert(pqiot_derive_keys(ss, sizeof(ss), &a) == 0);
-    assert(pqiot_derive_keys(ss, sizeof(ss), &b) == 0);
+    assert(pqiot_derive_keys(ss, sizeof(ss), 1, &a) == 0); /* as server */
+    assert(pqiot_derive_keys(ss, sizeof(ss), 0, &b) == 0); /* as device */
 
-    assert(memcmp(&a, &b, sizeof(a)) == 0); /* deterministic */
+    /* deterministic: the four raw keys lead the struct */
+    assert(memcmp(a.hs_c2s, b.hs_c2s, 4 * PQIOT_KEY_SZ) == 0);
     k[0] = a.hs_c2s; k[1] = a.hs_s2c; k[2] = a.c2s; k[3] = a.s2c;
     for (i = 0; i < 4; i++)                  /* separated */
         for (j = i + 1; j < 4; j++)
             assert(memcmp(k[i], k[j], PQIOT_KEY_SZ) != 0);
 
+    /* tx/rx are keyed from the right raw key for the role and phase: what
+     * the server sends, the device receives, and each matches the raw key. */
+    assert(seals_under(&a.tx, a.hs_s2c) && seals_under(&a.rx, a.hs_c2s));
+    assert(seals_under(&b.tx, b.hs_c2s) && seals_under(&b.rx, b.hs_s2c));
+    assert(pqiot_keys_phase(&a, PQIOT_PHASE_DATA) == 0);
+    assert(pqiot_keys_phase(&b, PQIOT_PHASE_DATA) == 0);
+    assert(seals_under(&a.tx, a.s2c) && seals_under(&a.rx, a.c2s));
+    assert(seals_under(&b.tx, b.c2s) && seals_under(&b.rx, b.s2c));
+
+    /* Freeing wipes the keys. */
+    pqiot_keys_free(&b);
+    for (i = 0; i < PQIOT_KEY_SZ; i++)
+        assert(b.c2s[i] == 0);
+    pqiot_keys_free(&a);
+
     /* A wrong-sized secret must be refused, not silently padded. */
-    assert(pqiot_derive_keys(ss, sizeof(ss) - 1, &a) != 0);
+    assert(pqiot_derive_keys(ss, sizeof(ss) - 1, 1, &a) != 0);
 
     printf("ok  key derivation (HKDF-SHA256, directions and phases separated)\n");
 }
@@ -65,19 +98,22 @@ static void test_aead_roundtrip(void)
 {
     static const char msg[] = "sensor=temp value=23.4C";
     uint8_t key[PQIOT_KEY_SZ];
+    Aes aes;
     uint8_t sealed[256], out[256];
     size_t slen, olen;
 
     memset(key, 0x42, sizeof(key));
-    assert(pqiot_seal(key, (const uint8_t *)msg, strlen(msg),
+    assert(pqiot_aead_init(&aes, key) == 0);
+    assert(pqiot_seal(&aes, (const uint8_t *)msg, strlen(msg),
                       sealed, sizeof(sealed), &slen) == 0);
     assert(slen == strlen(msg) + PQIOT_AEAD_OVERHEAD);
 
     /* The plaintext must not survive anywhere in the sealed frame. */
     assert(memmem(sealed, slen, msg, strlen(msg)) == NULL);
 
-    assert(pqiot_open(key, sealed, slen, out, sizeof(out), &olen) == 0);
+    assert(pqiot_open(&aes, sealed, slen, out, sizeof(out), &olen) == 0);
     assert(olen == strlen(msg) && memcmp(out, msg, olen) == 0);
+    wc_AesFree(&aes);
 
     printf("ok  aead roundtrip (AES-256-GCM)\n");
 }
@@ -86,34 +122,39 @@ static void test_aead_rejects_tampering(void)
 {
     static const char msg[] = "open the door";
     uint8_t key[PQIOT_KEY_SZ], wrong[PQIOT_KEY_SZ];
+    Aes aes, aes_wrong;
     uint8_t sealed[256], out[256];
     size_t slen, olen;
 
     memset(key, 0x42, sizeof(key));
     memset(wrong, 0x43, sizeof(wrong));
-    assert(pqiot_seal(key, (const uint8_t *)msg, strlen(msg),
+    assert(pqiot_aead_init(&aes, key) == 0);
+    assert(pqiot_aead_init(&aes_wrong, wrong) == 0);
+    assert(pqiot_seal(&aes, (const uint8_t *)msg, strlen(msg),
                       sealed, sizeof(sealed), &slen) == 0);
 
     /* Flipped cipher text bit. */
     sealed[PQIOT_AEAD_OVERHEAD] ^= 0x01;
-    assert(pqiot_open(key, sealed, slen, out, sizeof(out), &olen) != 0);
+    assert(pqiot_open(&aes, sealed, slen, out, sizeof(out), &olen) != 0);
     sealed[PQIOT_AEAD_OVERHEAD] ^= 0x01;
 
     /* Flipped tag bit. */
     sealed[PQIOT_IV_SZ] ^= 0x80;
-    assert(pqiot_open(key, sealed, slen, out, sizeof(out), &olen) != 0);
+    assert(pqiot_open(&aes, sealed, slen, out, sizeof(out), &olen) != 0);
     sealed[PQIOT_IV_SZ] ^= 0x80;
 
     /* Wrong key. */
-    assert(pqiot_open(wrong, sealed, slen, out, sizeof(out), &olen) != 0);
+    assert(pqiot_open(&aes_wrong, sealed, slen, out, sizeof(out), &olen) != 0);
 
     /* Truncated below the IV+tag header: must not underflow the length. */
-    assert(pqiot_open(key, sealed, PQIOT_AEAD_OVERHEAD - 1,
+    assert(pqiot_open(&aes, sealed, PQIOT_AEAD_OVERHEAD - 1,
                       out, sizeof(out), &olen) != 0);
 
     /* Output buffer too small for the plaintext. */
-    assert(pqiot_open(key, sealed, slen, out, 1, &olen) != 0);
+    assert(pqiot_open(&aes, sealed, slen, out, 1, &olen) != 0);
 
+    wc_AesFree(&aes);
+    wc_AesFree(&aes_wrong);
     printf("ok  aead rejects tampering, wrong key, truncation\n");
 }
 
@@ -154,30 +195,36 @@ static void test_framing(void)
         static const char secret[] = "CN=device-0001.pqiot.test";
         uint8_t key[PQIOT_KEY_SZ], wrong[PQIOT_KEY_SZ];
 
+        Aes aes, aes_wrong;
+
         memset(key, 0x11, sizeof(key));
         memset(wrong, 0x22, sizeof(wrong));
+        assert(pqiot_aead_init(&aes, key) == 0);
+        assert(pqiot_aead_init(&aes_wrong, wrong) == 0);
 
-        assert(pqiot_send_sealed(sv[0], key, PQIOT_MSG_CERT,
+        assert(pqiot_send_sealed(sv[0], &aes, PQIOT_MSG_CERT,
                                  (const uint8_t *)secret, strlen(secret)) == 0);
         assert(pqiot_recv(sv[1], &type, got, sizeof(got), &len) == 0);
         assert(type == PQIOT_MSG_CERT && len == strlen(secret) + PQIOT_AEAD_OVERHEAD);
         assert(memmem(got, len, secret, strlen(secret)) == NULL);
 
-        assert(pqiot_send_sealed(sv[0], key, PQIOT_MSG_CERT,
+        assert(pqiot_send_sealed(sv[0], &aes, PQIOT_MSG_CERT,
                                  (const uint8_t *)secret, strlen(secret)) == 0);
-        assert(pqiot_recv_sealed(sv[1], key, PQIOT_MSG_CERT,
+        assert(pqiot_recv_sealed(sv[1], &aes, PQIOT_MSG_CERT,
                                  got, sizeof(got), &len) == 0);
         assert(len == strlen(secret) && memcmp(got, secret, len) == 0);
 
-        assert(pqiot_send_sealed(sv[0], key, PQIOT_MSG_CERT,
+        assert(pqiot_send_sealed(sv[0], &aes, PQIOT_MSG_CERT,
                                  (const uint8_t *)secret, strlen(secret)) == 0);
-        assert(pqiot_recv_sealed(sv[1], wrong, PQIOT_MSG_CERT,
+        assert(pqiot_recv_sealed(sv[1], &aes_wrong, PQIOT_MSG_CERT,
                                  got, sizeof(got), &len) != 0);
 
-        assert(pqiot_send_sealed(sv[0], key, PQIOT_MSG_CERT,
+        assert(pqiot_send_sealed(sv[0], &aes, PQIOT_MSG_CERT,
                                  (const uint8_t *)secret, strlen(secret)) == 0);
-        assert(pqiot_recv_sealed(sv[1], key, PQIOT_MSG_VERIFY,
+        assert(pqiot_recv_sealed(sv[1], &aes, PQIOT_MSG_VERIFY,
                                  got, sizeof(got), &len) != 0);
+        wc_AesFree(&aes);
+        wc_AesFree(&aes_wrong);
     }
 
     close(sv[0]);
