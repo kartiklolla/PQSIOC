@@ -40,6 +40,21 @@ int pqiot_fw_seed(unsigned char *output, unsigned int sz);
 #define HAVE_AESGCM
 #define GCM_TABLE_4BIT
 #define WOLFSSL_AES_DIRECT
+/* Bitsliced AES: constant-time without lookup tables. wolfSSL's default on
+ * RISC-V is table AES with WOLFSSL_AES_TOUCH_LINES (every lookup reads the
+ * whole table, against cache-timing attacks): ~75k cycles per block here,
+ * which made AES-GCM the slowest part of the handshake.
+ *
+ * Bitslice width, measured on this core (make fw-bench / fw-demo):
+ *            context  key setup  seal 23 B  per extra KB
+ *   64       emulated on RV32 -- not considered
+ *   32       31.5 KB  1.69 M     0.52 M     0.09 M cycles
+ *   16        8.5 KB  0.86 M     0.39 M     0.32 M cycles   <- chosen
+ * 16 is about even on the handshake, cheaper per telemetry message, and
+ * saves ~46 KB of stack across a session's two contexts (pqiot_keys). */
+#define WC_AES_BITSLICED
+#define HAVE_AES_ECB
+#define WC_AES_BS_WORD_SIZE 16
 #define HAVE_HKDF
 #define WOLFSSL_ASN_TEMPLATE
 #define KEEP_PEER_CERT           /* X509 parsing API used by pqiot_auth_verify */
