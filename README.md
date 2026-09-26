@@ -124,7 +124,7 @@ CAPTURE=1 make fw-net-demo   # ... and record/check tap0 -> demo-fw-net.pcap
 [device] -> KEMCT    1088 bytes (ML-KEM cipher text)
 [device] <- CERT, VERIFY: server authenticated: CN=server.pqiot.test (ML-DSA-65)
 [device] <- DATA     51 bytes -> decrypted: "ack: telemetry received"
-[fw] whole session: 142809619 cycles
+[fw] whole session: 70701530 cycles
 PQIOT bare-metal demo: OK
   [server] <- CERT, VERIFY: device authenticated: CN=device-0001.pqiot.test (ML-DSA-65)
 ```
@@ -135,14 +135,14 @@ firmware's verdict, in about two to three minutes of real time.
 - **`fw-demo`** runs one full session with **both ends on the RISC-V CPU**.
   They are two cooperative threads (a small assembly context switch,
   `firmware/switch.S`) exchanging messages through in-memory pipes. The whole
-  session takes 280–295 M cycles, about 5 minutes of simulated time at
-  1 MHz. The count varies between builds because each image has its own
-  seed, and ML-DSA signing retries a random number of times.
+  session takes 135–175 M cycles, 2–3 minutes of simulated time at 1 MHz.
+  The count varies between builds because each image has its own seed, and
+  ML-DSA signing retries a random number of times.
 - **`fw-net-demo`** runs **only the device** on the SoC, with its Ethernet
   MAC on the host's `tap0`. It talks to the **unmodified native
-  `pqiot-server`**, which can't tell it from the Linux client. The device
-  side takes about 143 M cycles. The run passes only if the device, the
-  server and the bridge all succeed.
+  `pqiot-server`**, which can't tell it from the Linux client. The device's
+  side takes 71–75 M cycles (see [Benchmarks](#benchmarks)). The run passes
+  only if the device, the server and the bridge all succeed.
 - **Same protocol code.** Both images run `src/session.c` and `src/pqiot.c`,
   the code the Linux binaries use. Only the transport underneath differs:
   pipes in `firmware/pipes.c`, UDP in `firmware/udp_stream.c`, sockets in
@@ -155,8 +155,9 @@ firmware's verdict, in about two to three minutes of real time.
   it holds no keys and can't read the session. It was tested with 20%
   packet loss in both directions.
 - **wolfSSL** is compiled from the same pinned v5.9.2 source, configured by
-  `firmware/user_settings.h` with the same algorithms as the host build. The
-  image is about 270 KB. The device-only image carries the CA and the
+  `firmware/user_settings.h` with the same algorithms as the host build,
+  but with constant-time bitsliced AES (see Benchmarks). The image is about
+  245–260 KB. The device-only image carries the CA and the
   device's key, never the server's.
 
 **Setup**, once (Arch package names):
@@ -227,51 +228,73 @@ make bench      # host: primitives, session/handshake latency, reliability, wire
 make fw-bench   # bare-metal: the same primitives in VexRiscv CPU cycles
 ```
 
-These are measured, not estimated. Host: AMD Ryzen 7 7730U, GCC 16.2, `-O2`.
-Bare metal: VexRiscv (RV32IM) in the LiteX simulator, same wolfSSL build.
-Median of 50 runs (host) or 3 runs (bare metal):
+These are measured, not estimated. Host: AMD Ryzen 7 7730U, GCC 16.2, `-O2`
+(times vary about ±30% with CPU boost; ranges are across runs). Bare metal:
+VexRiscv (RV32IM) in the LiteX simulator, the same wolfSSL release with
+`firmware/user_settings.h`. Medians of 50 (host) or 3 (bare metal) runs:
 
 | Operation | Host | Bare-metal cycles | ms at 100 MHz |
 |---|---:|---:|---:|
-| ML-KEM-768 keygen | 35–44 µs | 2.20 M | 22 |
-| ML-KEM-768 encapsulate | 38 µs | 2.37 M | 24 |
-| ML-KEM-768 decapsulate | 47 µs | 2.96 M | 30 |
-| HKDF-SHA256, 4 session keys | 11–13 µs | 0.37 M | 3.7 |
-| AES-256-GCM seal, 23 B telemetry | 4.8 µs | 0.38 M | 3.8 |
-| AES-256-GCM open, 23 B telemetry | 2.4–2.8 µs | 0.34 M | 3.4 |
-| AES-256-GCM seal, 1 KB | 14 µs | 5.05 M | 51 |
-| ML-DSA-65 sign transcript | 0.32–0.33 ms | 13.2 M | 132 |
-| Peer auth (X.509 chain + ML-DSA-65 verify) | 0.25 ms | 24.4 M | 244 |
+| ML-KEM-768 keygen | 29–44 µs | 2.20 M | 22 |
+| ML-KEM-768 encapsulate | 26–38 µs | 2.37 M | 24 |
+| ML-KEM-768 decapsulate | 32–47 µs | 2.96 M | 30 |
+| HKDF + key tx/rx AES-GCM (once per phase) | 8–12 µs | 2.22 M | 22 |
+| AES-256-GCM seal, 23 B telemetry | 3.3–4.8 µs | 0.39 M | 3.9 |
+| AES-256-GCM open, 23 B telemetry | 1.9–2.8 µs | 0.35 M | 3.5 |
+| AES-256-GCM seal, 1 KB | 9.6–14 µs | 0.70 M | 7.0 |
+| ML-DSA-65 sign transcript | 0.22–0.33 ms | 13–28 M, varies | 130–280 |
+| Peer auth (X.509 chain + ML-DSA-65 verify) | 0.17–0.25 ms | 24.4 M | 244 |
 
 The simulator's clock is 1 MHz nominal; the 100 MHz column is the same
-cycle count on a typical small FPGA soft core or microcontroller.
+cycle count on a typical small FPGA soft core or microcontroller. ML-DSA
+signing retries a random number of times, so its cost, and each session's,
+varies with the random values: each firmware build has its own seed.
 
-| Whole session / handshake | Latency (median, min–max) | Succeeded |
+| Whole session / handshake | Median (min–max) | Succeeded |
 |---|---:|---:|
-| PQIOT/2 session, host (handshake, mutual auth, DATA round trip) | 2.8 ms (2.3–4.2) | 150 / 150 |
-| TLS 1.3 handshake, host loopback | 2.3 ms (1.8–3.5) | 50 / 50 |
-| DTLS 1.3 handshake, host loopback | 3.1 ms (2.5–4.1) | 50 / 50 |
-| PQIOT/2 session, both ends on bare metal | 290 M cycles (2.9 s at 100 MHz) | every run |
-| PQIOT/2 session, bare-metal device's side | 143 M cycles (1.4 s at 100 MHz) | every run |
+| PQIOT/2 session, host (handshake, mutual auth, DATA round trip) | 1.9–2.9 ms | 150 / 150 |
+| TLS 1.3 handshake, host loopback | 2.3–2.4 ms | 100 / 100 |
+| DTLS 1.3 handshake, host loopback | 3.0–3.1 ms | 100 / 100 |
+| PQIOT/2 session, bare-metal device's side | 71–75 M cycles (0.7 s at 100 MHz) | every run |
+| PQIOT/2 session, both ends on bare metal | 135–175 M cycles | every run |
 
-The 150 host sessions are 100 from `pqiot-bench` plus 50 from `make bench`.
 No run of any target has failed or crashed.
 
-**Where the bare-metal time goes.** The primitives above explain the device's
-~143 M cycles almost exactly:
+### Finding and fixing the AES bottleneck
 
-| Share of the device's session | Cycles |
-|---|---:|
-| AES-GCM on the sealed CERT and VERIFY (≈17.6 KB) | ≈ 82 M |
-| ML-DSA-65: sign once, verify the server once | ≈ 38 M |
-| SHA-256 transcript, ML-KEM encapsulate, HKDF | ≈ 12 M |
+The first bare-metal numbers had the device's session at **143 M cycles**,
+and the primitives explained where it went: AES-GCM took about 82 M of it,
+more than all of ML-KEM and ML-DSA together. Timing AES and GHASH
+separately showed GHASH was fine (≈180 cycles/byte). The AES block cipher
+cost **≈75 000 cycles per block**. The cause is a wolfSSL default: on
+RISC-V it builds table AES with `WOLFSSL_AES_TOUCH_LINES`, which reads the
+whole lookup table on every access so memory access patterns don't depend on
+the key. It defends against cache-timing attacks, and it's very slow.
 
-So the post-quantum algorithms are not the bottleneck on this core.
-AES-GCM runs at about 4 700 cycles per byte, which is slow for software
-AES-GCM on a 32-bit CPU, and encrypting the certificates for identity
-privacy costs more than all the ML-KEM and ML-DSA work together. This hasn't
-been tuned yet; wolfSSL's GCM variant for 32-bit CPUs is the first thing to
-try.
+The fix keeps AES constant-time but makes it fast:
+
+1. **Bitsliced AES** (`WC_AES_BITSLICED`): no lookup tables at all, so it is
+   constant-time by construction. Bulk encryption went from ~4.7 M to about
+   0.1–0.3 M cycles per KB.
+2. **Key once per phase, not per message.** Bitsliced key setup costs
+   ~0.9–1.7 M cycles, more than sealing a small message. `pqiot_keys` now
+   holds one sending and one receiving AES-GCM context, keyed for the
+   handshake and re-keyed once for DATA. That's two contexts, not four, to
+   keep RAM down.
+3. **16-bit bitslice words**, chosen by measuring 32 against 16 (the default
+   64 would be emulated on RV32). 16 costs about the same per handshake, is
+   ~25% cheaper per telemetry message, and saves ~46 KB of stack. The
+   measurements are in `firmware/user_settings.h`.
+
+| Bare metal | Before | After |
+|---|---:|---:|
+| Device's side of a session | 143 M cycles | **71–75 M** (−50%) |
+| AES-GCM seal, 1 KB | 5.05 M | **0.70 M** |
+| AES-GCM seal, 23 B telemetry | 0.38 M | 0.39 M |
+| Stack per session role | 48.7 KB | 65.7 KB |
+
+The host build is unchanged apart from keying once per phase: it uses table
+AES and is fast either way.
 
 **Bytes on the wire per session** (payload, each direction):
 
@@ -280,21 +303,25 @@ try.
 | PQIOT/2 over TCP | 10 067 B, 4 packets | 10 188 B, 6 packets |
 | TLS 1.3 | 10 391 B, 4 packets | 10 339 B, 8 packets |
 | DTLS 1.3 | 12 110 B, 14 packets | 10 927 B, 16 packets |
+| PQIOT/2, bare metal over UDP | 10 232 B, 33 datagrams | 12 401 B, 33 datagrams |
 
 Each direction is dominated by one ML-DSA-65 certificate (≈5.5 KB) and one
-signature (3 309 B). ML-KEM costs 1 184 B one way and 1 088 B the other.
+signature (3 309 B). ML-KEM costs 1 184 B one way and 1 088 B the other. The
+UDP row adds 5-byte chunk headers, acknowledgements, and some
+retransmissions: the bridge backs off, but the simulated device can't answer
+while it verifies an ML-DSA signature.
 
 **Memory on the bare-metal device:**
 
 | | Bytes |
 |---|---:|
-| Firmware code + read-only data, device-only image | 254 976 |
-| Static RAM (data + bss), device-only image | 41 232 |
-| Stack high-water, one session role | ≈ 48 700 |
+| Firmware code + read-only data, device-only image | 244 748 |
+| Static RAM (data + bss), device-only image | 41 224 |
+| Stack high-water, one session role | ≈ 65 700 |
 | Heap high-water | ≤ 79 196 (both ends together) |
 
-A device therefore needs about 250 KB of flash and about 170 KB of RAM,
-which is within reach of larger microcontrollers.
+A device therefore needs about 240 KB of flash and about 190 KB of RAM,
+within reach of larger microcontrollers.
 
 ## Protocol — PQIOT/2
 
