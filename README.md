@@ -220,6 +220,82 @@ feature set). Later builds reuse it; `make distclean` removes it.
 handshake only completes if both architectures derive the same ML-KEM shared
 secret, so a passing run shows the two builds interoperate.
 
+## Benchmarks
+
+```bash
+make bench      # host: primitives, session/handshake latency, reliability, wire and image sizes
+make fw-bench   # bare-metal: the same primitives in VexRiscv CPU cycles
+```
+
+These are measured, not estimated. Host: AMD Ryzen 7 7730U, GCC 16.2, `-O2`.
+Bare metal: VexRiscv (RV32IM) in the LiteX simulator, same wolfSSL build.
+Median of 50 runs (host) or 3 runs (bare metal):
+
+| Operation | Host | Bare-metal cycles | ms at 100 MHz |
+|---|---:|---:|---:|
+| ML-KEM-768 keygen | 35–44 µs | 2.20 M | 22 |
+| ML-KEM-768 encapsulate | 38 µs | 2.37 M | 24 |
+| ML-KEM-768 decapsulate | 47 µs | 2.96 M | 30 |
+| HKDF-SHA256, 4 session keys | 11–13 µs | 0.37 M | 3.7 |
+| AES-256-GCM seal, 23 B telemetry | 4.8 µs | 0.38 M | 3.8 |
+| AES-256-GCM open, 23 B telemetry | 2.4–2.8 µs | 0.34 M | 3.4 |
+| AES-256-GCM seal, 1 KB | 14 µs | 5.05 M | 51 |
+| ML-DSA-65 sign transcript | 0.32–0.33 ms | 13.2 M | 132 |
+| Peer auth (X.509 chain + ML-DSA-65 verify) | 0.25 ms | 24.4 M | 244 |
+
+The simulator's clock is 1 MHz nominal; the 100 MHz column is the same
+cycle count on a typical small FPGA soft core or microcontroller.
+
+| Whole session / handshake | Latency (median, min–max) | Succeeded |
+|---|---:|---:|
+| PQIOT/2 session, host (handshake, mutual auth, DATA round trip) | 2.8 ms (2.3–4.2) | 150 / 150 |
+| TLS 1.3 handshake, host loopback | 2.3 ms (1.8–3.5) | 50 / 50 |
+| DTLS 1.3 handshake, host loopback | 3.1 ms (2.5–4.1) | 50 / 50 |
+| PQIOT/2 session, both ends on bare metal | 290 M cycles (2.9 s at 100 MHz) | every run |
+| PQIOT/2 session, bare-metal device's side | 143 M cycles (1.4 s at 100 MHz) | every run |
+
+The 150 host sessions are 100 from `pqiot-bench` plus 50 from `make bench`.
+No run of any target has failed or crashed.
+
+**Where the bare-metal time goes.** The primitives above explain the device's
+~143 M cycles almost exactly:
+
+| Share of the device's session | Cycles |
+|---|---:|
+| AES-GCM on the sealed CERT and VERIFY (≈17.6 KB) | ≈ 82 M |
+| ML-DSA-65: sign once, verify the server once | ≈ 38 M |
+| SHA-256 transcript, ML-KEM encapsulate, HKDF | ≈ 12 M |
+
+So the post-quantum algorithms are not the bottleneck on this core.
+AES-GCM runs at about 4 700 cycles per byte, which is slow for software
+AES-GCM on a 32-bit CPU, and encrypting the certificates for identity
+privacy costs more than all the ML-KEM and ML-DSA work together. This hasn't
+been tuned yet; wolfSSL's GCM variant for 32-bit CPUs is the first thing to
+try.
+
+**Bytes on the wire per session** (payload, each direction):
+
+| Transport | Device → server | Server → device |
+|---|---:|---:|
+| PQIOT/2 over TCP | 10 067 B, 4 packets | 10 188 B, 6 packets |
+| TLS 1.3 | 10 391 B, 4 packets | 10 339 B, 8 packets |
+| DTLS 1.3 | 12 110 B, 14 packets | 10 927 B, 16 packets |
+
+Each direction is dominated by one ML-DSA-65 certificate (≈5.5 KB) and one
+signature (3 309 B). ML-KEM costs 1 184 B one way and 1 088 B the other.
+
+**Memory on the bare-metal device:**
+
+| | Bytes |
+|---|---:|
+| Firmware code + read-only data, device-only image | 254 976 |
+| Static RAM (data + bss), device-only image | 41 232 |
+| Stack high-water, one session role | ≈ 48 700 |
+| Heap high-water | ≤ 79 196 (both ends together) |
+
+A device therefore needs about 250 KB of flash and about 170 KB of RAM,
+which is within reach of larger microcontrollers.
+
 ## Protocol — PQIOT/2
 
 Five message types over TCP. Every message carries an 8-byte header, so
@@ -378,17 +454,21 @@ src/pki.h        demo PKI paths and server name (both protocols)
 src/client.c     the IoT device, TCP front end
 src/server.c     the server, TCP front end
 src/selftest.c   the assertions behind `make check`
+src/bench.c      per-operation benchmarks (host and bare metal)
+src/bench_main.c `make bench`: primitives + whole-session latency
 src/pqtls.h      TLS/DTLS 1.3 policy: group, certificates, peer key check
 src/tls_client.c the IoT device over TLS/DTLS 1.3
 src/tls_server.c the server over TLS/DTLS 1.3
 tools/capture.sh packet capture and verification
 tools/tls-check.sh     OpenSSL interop and refusal cases
 tools/tls-capture.sh   TLS/DTLS capture: key share groups on the wire
+tools/bench.sh         `make bench`: latency, reliability, wire and image sizes
 tools/fw-demo.sh       boot the bare-metal firmware, wait for its verdict
 tools/fw-net-demo.sh   bare-metal device + bridge + native server (+ capture)
 tools/udp-bridge.py    device's reliable UDP stream <-> TCP pqiot-server
 firmware/main.c        bare metal: device and server as coroutines
 firmware/main_net.c    bare metal: device only, over Ethernet
+firmware/main_bench.c  bare metal: `make fw-bench` cycle counts
 firmware/pipes.c, udp_stream.c   the two bare-metal transports
 firmware/platform.c    DRBG seed and clock for bare metal
 firmware/switch.S      coroutine context switch (RV32/RV64)
