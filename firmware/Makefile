@@ -5,6 +5,7 @@
 #
 #   NET=0  pqiot-fw.bin      device + server on one CPU, in-memory pipes
 #   NET=1  pqiot-fw-net.bin  device only, over the SoC's Ethernet (UDP)
+#   BENCH=1 pqiot-fw-bench.bin  per-operation cycle counts (src/bench.c)
 
 BUILD_DIR ?= ../build/litex-sim
 include $(BUILD_DIR)/software/include/generated/variables.mak
@@ -14,15 +15,20 @@ TOP     := $(abspath ..)
 WOLFSSL := $(TOP)/build/wolfssl-src
 CERTS   := $(TOP)/build/certs
 NET     ?= 0
-ifeq ($(NET),1)
+BENCH   ?= 0
+ifeq ($(BENCH),1)
+IMAGE   := pqiot-fw-bench
+OBJDIR  := $(TOP)/build/fw-bench
+APP     := main_bench.o bench.o
+else ifeq ($(NET),1)
 IMAGE   := pqiot-fw-net
 OBJDIR  := $(TOP)/build/fw-net
-APP     := main_net.o udp_stream.o
+APP     := main_net.o udp_stream.o session.o
 CFLAGS  += -DPQIOT_FW_DEVICE_ONLY
 else
 IMAGE   := pqiot-fw
 OBJDIR  := $(TOP)/build/fw
-APP     := main.o pipes.o
+APP     := main.o pipes.o session.o
 endif
 
 CFLAGS += -O2 -DWOLFSSL_USER_SETTINGS -I$(CURDIR) -I$(OBJDIR) \
@@ -35,7 +41,7 @@ WOLF_CFLAGS := $(filter-out -Wstrict-prototypes -Wold-style-definition \
 WOLF_SRCS := $(wildcard $(WOLFSSL)/wolfcrypt/src/*.c) $(wildcard $(WOLFSSL)/src/*.c)
 WOLF_OBJS := $(patsubst $(WOLFSSL)/%.c,$(OBJDIR)/wolfssl/%.o,$(WOLF_SRCS))
 APP_OBJS  := $(addprefix $(OBJDIR)/,crt0.o $(APP) platform.o switch.o certs.o \
-                                    pqiot.o session.o)
+                                    pqiot.o)
 
 COMMA = ,
 REGULAR_LIBS = $(filter-out $(ALWAYS_LINK_LIBS),$(LIBS))

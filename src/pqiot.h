@@ -176,6 +176,12 @@ int pqiot_auth_verify(const pqiot_identity *self, const uint8_t *cert,
 int pqiot_server_session(int fd, pqiot_identity *id);
 int pqiot_device_session(int fd, const char *msg, pqiot_identity *id);
 
+/* Time every operation a session performs, `iters` (1..64) times each,
+ * and print min/median/max in the units `now` counts (src/bench.c).
+ * `id` signs and is verified against itself. 0 on success. */
+int pqiot_bench(int iters, uint64_t (*now)(void), const char *unit,
+                pqiot_identity *id);
+
 /* Platform hooks behind the framed I/O: POSIX read/write on a socket in
  * src/pqiot_posix.c, in-memory pipes on bare metal. Same contract as
  * read(2)/write(2): bytes moved (possibly fewer), 0 = peer closed (read),

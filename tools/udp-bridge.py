@@ -21,7 +21,10 @@ import time
 
 DATA, ACK, HELLO = 0, 1, 2
 CHUNK = 1024
-RTO = 1.0         # s without an ACK before resending: the simulator is slow
+# Resend after RTO s without an ACK, doubling up to RTO_MAX: while the
+# simulated CPU verifies an ML-DSA signature it can't answer for ~10 s of
+# wall clock, and a fixed timer would just flood it with duplicates.
+RTO, RTO_MAX = 1.0, 16.0
 GIVE_UP = 600.0   # s without hearing from the device at all
 
 
@@ -58,6 +61,7 @@ def main():
 
     to_device = b""          # server bytes not yet ACKed by the device
     tx_seq, tx_len, tx_at = 0, 0, 0.0   # outstanding DATA: seq, size, sent at
+    rto = RTO
     rx_expected = 1          # device DATA starts at 1 (HELLO was 0)
     server_open = True
     heard = time.monotonic()
@@ -69,7 +73,9 @@ def main():
             print("[bridge] device went quiet, giving up", file=sys.stderr)
             return 1
         # (Re)send the chunk at the head of the queue.
-        if to_device and (tx_len == 0 or now - tx_at > RTO):
+        if to_device and (tx_len == 0 or now - tx_at > rto):
+            if tx_len:
+                rto = min(rto * 2, RTO_MAX)   # a resend: back off
             tx_len = min(len(to_device), CHUNK)
             send(DATA, tx_seq, to_device[:tx_len])
             tx_at = now
@@ -93,7 +99,7 @@ def main():
             if kind == ACK and tx_len and seq == tx_seq:
                 moved[1] += tx_len
                 to_device = to_device[tx_len:]
-                tx_seq, tx_len = tx_seq + 1, 0
+                tx_seq, tx_len, rto = tx_seq + 1, 0, RTO
             elif kind == DATA:
                 if seq == rx_expected:
                     tcp.sendall(pkt[5:])

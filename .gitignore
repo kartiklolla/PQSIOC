@@ -2,6 +2,8 @@
 pqiot-server
 pqiot-client
 pqiot-selftest
+pqiot-bench
+__pycache__/
 pqtls-server
 pqtls-client
 *.rv64

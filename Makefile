@@ -4,6 +4,7 @@
 #   make check    run the crypto/framing/authentication self-check
 #   make demo     run a full loopback session (mutual ML-DSA-65 auth)
 #   make capture  same, under tshark, writing demo.pcap
+#   make bench    latency, reliability, wire and image sizes (fw-bench: cycles)
 #
 #   make riscv        cross-build all three for riscv64 (static)
 #   make riscv-check  run the self-check under qemu-riscv64
@@ -45,9 +46,9 @@ BAD_CERTS := build/certs/bad/rogue.pem build/certs/bad/ecdsa-srv.pem \
 PORT ?= 4433
 MSG  ?= sensor=temp value=23.4C
 
-BINS := pqiot-server pqiot-client pqiot-selftest
+BINS := pqiot-server pqiot-client pqiot-selftest pqiot-bench
 OBJS := src/pqiot.o src/pqiot_posix.o src/session.o \
-        src/server.o src/client.o src/selftest.o
+        src/server.o src/client.o src/selftest.o src/bench.o src/bench_main.o
 # Shared by every native binary: protocol core + the POSIX platform hooks.
 CORE := src/pqiot.o src/pqiot_posix.o
 
@@ -62,6 +63,9 @@ pqiot-client: src/client.o src/session.o $(CORE)
 pqiot-selftest: src/selftest.o $(CORE)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
+pqiot-bench: src/bench_main.o src/bench.o src/session.o $(CORE)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
 src/%.o: src/%.c src/pqiot.h src/pki.h
 	$(CC) $(CFLAGS) -Ibuild/host/include -c -o $@ $<
 
@@ -72,6 +76,11 @@ $(OBJS): $(HOST_LIB)
 
 check: pqiot-selftest $(CERTS) $(BAD_CERTS)
 	./pqiot-selftest
+
+# Latency, reliability, wire size and firmware size (tools/bench.sh);
+# bare-metal cycle counts: make fw-bench.
+bench: pqiot-bench pqtls-server pqtls-client $(CERTS)
+	@tools/bench.sh 50 $(PORT)
 
 # Server runs in the background; its exit status is folded into ours so a
 # failed session fails the target.
@@ -275,6 +284,14 @@ fw-demo: fw
 	@LITEX_SIM="$(LITEX_SIM)" FW_SIM_ARGS="$(FW_SIM_ARGS)" \
 	 tools/fw-demo.sh $(FW_BIN)
 
+# Per-operation cycle counts on the same bare-metal SoC (src/bench.c).
+FW_BENCH_BIN := build/fw-bench/pqiot-fw-bench.bin
+fw-bench: $(FW_SOC) $(CERTS) | $(WOLF_SRC)
+	PATH=$(LITEX_VENV)/bin:$$PATH $(MAKE) -C firmware BENCH=1 \
+	    BUILD_DIR=$(CURDIR)/$(FW_SIM_DIR)
+	@LOG=build/fw-bench/sim.log LITEX_SIM="$(LITEX_SIM)" \
+	 FW_SIM_ARGS="$(FW_SIM_ARGS)" tools/fw-demo.sh $(FW_BENCH_BIN)
+
 # Same SoC plus an Ethernet MAC on the host's tap0: 192.168.1.50 on the SoC,
 # 192.168.1.100 on the host (litex_sim's defaults).
 FW_NET_SIM_DIR  := build/litex-sim-eth
@@ -305,7 +322,7 @@ clean:
 distclean: clean
 	rm -rf build
 
-.PHONY: all check demo capture certs tls tls-demo tls-check tls-capture fw fw-demo fw-net fw-net-demo \
+.PHONY: all check demo capture certs tls tls-demo tls-check tls-capture fw fw-demo fw-bench fw-net fw-net-demo bench \
         riscv riscv-check riscv-demo riscv-capture riscv-tls-demo \
         riscv-tls-capture \
         clean distclean

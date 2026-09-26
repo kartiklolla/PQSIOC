@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <generated/csr.h>
 #include <generated/soc.h>
@@ -36,8 +37,23 @@ static struct coro {
 static coro_ctx main_ctx;
 static int cur;
 
-/* Generous: the session keeps several 8 KB frame buffers on its stack. */
+/* Generous: the session keeps several 8 KB frame buffers on its stack.
+ * Painted before the run so the high-water mark can be read back after. */
+#define STACK_PAINT 0xa5
 static uint8_t stacks[2][256 * 1024] __attribute__((aligned(16)));
+
+/* Bytes of a coroutine stack ever touched: stacks grow down, so scan up
+ * from the bottom for the first byte the paint no longer covers. */
+static size_t stack_used(int i)
+{
+    size_t n = 0;
+
+    while (n < sizeof(stacks[i]) && stacks[i][n] == STACK_PAINT)
+        n++;
+    return sizeof(stacks[i]) - n;
+}
+
+extern char __heap_start[];
 
 static void coro_entry(void)
 {
@@ -67,6 +83,7 @@ static void run_both(void)
     size_t last = (size_t)-1;
     int i, finished;
 
+    memset(stacks, STACK_PAINT, sizeof(stacks));
     for (i = 0; i < 2; i++) {
         co[i].ctx.r[0] = (unsigned long)coro_entry;
         co[i].ctx.r[1] = (unsigned long)(stacks[i] + sizeof(stacks[i]));
@@ -163,6 +180,10 @@ int main(void)
     printf("[fw] wire: %lu bytes device->server, %lu bytes server->device\n",
            (unsigned long)fw_wire_bytes(0), (unsigned long)fw_wire_bytes(1));
     printf("[fw] whole session: %lu cycles\n", (unsigned long)(t1 - t0));
+    printf("[fw] stack high-water: server %lu bytes, device %lu bytes\n",
+           (unsigned long)stack_used(SERVER), (unsigned long)stack_used(DEVICE));
+    printf("[fw] heap high-water (both ends + identities' keys): %lu bytes\n",
+           (unsigned long)((char *)sbrk(0) - __heap_start));
     printf("PQIOT bare-metal demo: %s\n", ok ? "OK" : "FAILED");
 
     for (;;)

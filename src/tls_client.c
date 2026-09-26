@@ -11,7 +11,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
+
+static double now_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
 
 int main(int argc, char **argv)
 {
@@ -22,6 +31,7 @@ int main(int argc, char **argv)
     uint16_t port;
     char buf[1024];
     int dtls = 0, fd = -1, ret, rc = 1;
+    double t0, t1;
 
     if (argc > 1 && strcmp(argv[1], "--dtls") == 0) {
         dtls = 1;
@@ -66,12 +76,17 @@ int main(int argc, char **argv)
         goto out;
     }
 
+    /* Timed for tools/bench.sh: the whole handshake, both flights and
+     * mutual ML-DSA authentication, as the device experiences it. */
+    t0 = now_ms();
     ret = wolfSSL_connect(ssl);
+    t1 = now_ms();
     if (ret != WOLFSSL_SUCCESS) {
         pqtls_error(ssl, ret, "client", "handshake");
         goto out;
     }
     pqtls_report(ssl, "device");
+    printf("[device] handshake took %.3f ms\n", t1 - t0);
     if (pqtls_check_peer(ssl, "device") != 0)
         goto out;
 
